@@ -253,7 +253,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 [`~models.autoencoders.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is
                 returned.
         """
-        if self.use_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
+        if self.use_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size or x.shape[-3] > self.tile_sample_min_size): ### added third dim condition
             return self.tiled_encode(x, return_dict=return_dict)
 
         if self.use_slicing and x.shape[0] > 1:
@@ -261,6 +261,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             h = torch.cat(encoded_slices)
         else:
             h = self.encoder(x)
+            # print("### x shape:", x.shape, flush=True)
 
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
@@ -271,7 +272,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
-        if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
+        if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size or z.shape[-3] > self.tile_latent_min_size): ### added third dim condition
             return self.tiled_decode(z, return_dict=return_dict)
 
         z = self.post_quant_conv(z)
@@ -312,13 +313,19 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
         for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+            b[:, :, y, :, :] = a[:, :, -blend_extent + y, :, :] * (1 - y / blend_extent) + b[:, :, y, :, :] * (y / blend_extent)
         return b
 
     def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
         for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)
+            b[:, :, :, x, :] = a[:, :, :, -blend_extent + x, :] * (1 - x / blend_extent) + b[:, :, :, x, :] * (x / blend_extent)
+        return b
+    
+    def blend_d(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
+        for z in range(blend_extent):
+            b[:, :, :, :, z] = a[:, :, :, :, -blend_extent + z] * (1 - z / blend_extent) + b[:, :, :, :, z] * (z / blend_extent)
         return b
 
     def tiled_encode(self, x: torch.Tensor, return_dict: bool = True) -> AutoencoderKLOutput:
@@ -350,22 +357,30 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for i in range(0, x.shape[2], overlap_size):
             row = []
             for j in range(0, x.shape[3], overlap_size):
-                tile = x[:, :, i : i + self.tile_sample_min_size, j : j + self.tile_sample_min_size]
-                tile = self.encoder(tile)
-                tile = self.quant_conv(tile)
-                row.append(tile)
+                ro = []
+                for k in range(0, x.shape[4], overlap_size):
+                    tile = x[:, :, i : i + self.tile_sample_min_size, j : j + self.tile_sample_min_size, k : k + self.tile_sample_min_size]
+                    tile = self.encoder(tile)
+                    tile = self.quant_conv(tile)
+                    ro.append(tile)
+                row.append(ro)
             rows.append(row)
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
+            for j, ro in enumerate(row):
+                result_ro = []
+                for k, tile in enumerate(ro):
+                    # blend the above tile and the left tile
+                    # to the current tile and add the current tile to the result row
+                    if i > 0:
+                        tile = self.blend_v(rows[i - 1][j][k], tile, blend_extent)
+                    if j > 0:
+                        tile = self.blend_h(row[j - 1][k], tile, blend_extent)
+                    if k > 0:
+                        tile = self.blend_d(ro[k - 1], tile, blend_extent)
+                    result_ro.append(tile[:, :, :row_limit, :row_limit, :row_limit])
+                result_row.append(torch.cat(result_ro, dim=4))
             result_rows.append(torch.cat(result_row, dim=3))
 
         moments = torch.cat(result_rows, dim=2)
@@ -400,22 +415,30 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for i in range(0, z.shape[2], overlap_size):
             row = []
             for j in range(0, z.shape[3], overlap_size):
-                tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
-                tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
-                row.append(decoded)
+                ro = []
+                for k in range(0, z.shape[4], overlap_size):
+                    tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size, k : k + self.tile_latent_min_size]
+                    tile = self.post_quant_conv(tile)
+                    decoded = self.decoder(tile)
+                    ro.append(decoded)
+                row.append(ro)
             rows.append(row)
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
+            for j, ro in enumerate(row):
+                result_ro = []
+                for k, tile in enumerate(ro):
+                    # blend the above tile and the left tile
+                    # to the current tile and add the current tile to the result row
+                    if i > 0:
+                        tile = self.blend_v(rows[i - 1][j][k], tile, blend_extent)
+                    if j > 0:
+                        tile = self.blend_h(row[j - 1][k], tile, blend_extent)
+                    if k > 0:
+                        tile = self.blend_d(ro[k - 1], tile, blend_extent)
+                    result_ro.append(tile[:, :, :row_limit, :row_limit, :row_limit])
+                result_row.append(torch.cat(result_ro, dim=4))
             result_rows.append(torch.cat(result_row, dim=3))
 
         dec = torch.cat(result_rows, dim=2)

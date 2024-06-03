@@ -176,3 +176,6 @@ tags
 
 # wandb
 wandb
+
+# labs
+labs/_brain_ldm/result
