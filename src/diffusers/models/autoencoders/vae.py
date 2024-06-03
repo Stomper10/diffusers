@@ -794,7 +794,7 @@ class DiagonalGaussianDistribution(object):
             if other is None:
                 return 0.5 * torch.sum(
                     torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=[1, 2, 3],
+                    dim=[1, 2, 3, 4], ### consider depth
                 )
             else:
                 return 0.5 * torch.sum(
@@ -803,7 +803,7 @@ class DiagonalGaussianDistribution(object):
                     - 1.0
                     - self.logvar
                     + other.logvar,
-                    dim=[1, 2, 3],
+                    dim=[1, 2, 3, 4], ### consider depth
                 )
 
     def nll(self, sample: torch.Tensor, dims: Tuple[int, ...] = [1, 2, 3]) -> torch.Tensor:

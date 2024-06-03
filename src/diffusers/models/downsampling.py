@@ -139,7 +139,7 @@ class Downsample2D(nn.Module):
             hidden_states = self.norm(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         if self.use_conv and self.padding == 0:
-            pad = (0, 1, 0, 1)
+            pad = (0, 1, 0, 1, 0, 1) # pad = (0, 1, 0, 1) ### for ACS conv
             hidden_states = F.pad(hidden_states, pad, mode="constant", value=0)
 
         assert hidden_states.shape[1] == self.channels
