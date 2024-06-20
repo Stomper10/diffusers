@@ -384,6 +384,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             result_rows.append(torch.cat(result_row, dim=3))
 
         moments = torch.cat(result_rows, dim=2)
+        #print("### moments.shape:", moments.shape, flush=True)
         posterior = DiagonalGaussianDistribution(moments)
 
         if not return_dict:

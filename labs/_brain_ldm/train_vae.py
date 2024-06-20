@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-TODO: Implement validation
+TODO: Implement ZeRO3
 """
 
 import argparse
@@ -143,7 +143,7 @@ def log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch):
     
     images = []
     for i, sample in enumerate(test_dataloader):
-        if i < 10: # log 10 images
+        if i < 30: # log 10 images
             autocast_ctx = torch.autocast(accelerator.device.type)
             with autocast_ctx:
                 x = sample["pixel_values"].to(weight_dtype)
@@ -185,9 +185,10 @@ def log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch):
             logger.warn(f"image logging not implemented for {tracker.name}")
 
     del vae_model
+    del images
     torch.cuda.empty_cache()
 
-    return images
+    #return images
 
 
 def rgb_to_grayscale_3d(voxel_image):
@@ -696,7 +697,8 @@ def main():
                     model.save_pretrained(os.path.join(output_dir, "vae"))
 
                     # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
+                    if weights: ### https://github.com/huggingface/diffusers/issues/2606#issuecomment-1704077101
+                        weights.pop()
 
                 # vae = vae[0]
                 # vae.save_pretrained(os.path.join(output_dir, "vae"))
@@ -875,10 +877,10 @@ def main():
         [
             #transforms.LoadImaged(keys=["pixel_values"]),
             #transforms.EnsureChannelFirstd(keys=["pixel_values"]),
-            transforms.ScaleIntensityd(keys=["pixel_values"], minv=0.0, maxv=1.0),
+            transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
             transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
-            transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=0, above=True, cval=0),
+            transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
             # transforms.Lambdad(keys="pixel_values", func=lambda x: x[channel, :, :, :]),
             # transforms.AddChanneld(keys=["pixel_values"]),
@@ -1059,6 +1061,8 @@ def main():
     lpips_loss_fn = lpips.LPIPS(net="alex").to(accelerator.device, dtype=weight_dtype)
     lpips_loss_fn.requires_grad_(False)
 
+    #accelerator.init_deepspeed() ###
+
     for epoch in range(first_epoch, args.num_train_epochs):
         vae.train()
         if args.slicing:
@@ -1076,7 +1080,7 @@ def main():
             #         progress_bar.update(1)
             #     continue
             with accelerator.accumulate(vae):
-                target = batch["pixel_values"] #.to(memory_format=torch.channels_last_3d) #.to(weight_dtype) ###
+                target = batch["pixel_values"].to(weight_dtype) #.to(memory_format=torch.channels_last_3d) #.to(weight_dtype) ###
 
                 # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoder_kl.py
                 if accelerator.num_processes > 1:
@@ -1092,7 +1096,9 @@ def main():
                 else:
                     pred = vae.decode(z).sample
 
-                kl_loss = posterior.kl().mean()
+                if global_step > args.lr_warmup_steps:
+                    kl_loss = posterior.kl().mean()
+                    print("### kl loss", kl_loss, flush=True)
                 
                 # if global_step > args.mse_start:
                 #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
@@ -1111,27 +1117,28 @@ def main():
                 with torch.no_grad():
                     # for i, (pre, tar) in enumerate(zip(pred, target)):
                     lpips_loss = 0
-                    # print("### pred[..., i].squeeze(dim=-1) shape:", pred[..., 0].squeeze(dim=-1).shape)
-                    # print("### pred[..., i, :].squeeze(dim=-2) shape:", pred[..., 0, :].squeeze(dim=-2).shape)
-                    # print("### pred[..., i, :, :].squeeze(dim=-3) shape:", pred[..., 0, :, :].squeeze(dim=-3).shape)
+                    # print("### pred[:, :, :, :, i] shape:", pred[..., 0].shape)
+                    # print("### pred[:, :, :, i, :] shape:", pred[..., 0, :].shape)
+                    # print("### pred[:, :, i, :, :] shape:", pred[..., 0, :, :].shape)
                     for i in range(pred.shape[-1]):
-                        lpips_loss += lpips_loss_fn(pred[..., i].squeeze(dim=-1).to(dtype=weight_dtype), 
-                                                    target[..., i].squeeze(dim=-1).to(dtype=weight_dtype)).sum()#.mean()
+                        lpips_loss += lpips_loss_fn(pred[:, :, :, :, i].to(dtype=weight_dtype), 
+                                                    target[:, :, :, :, i].to(dtype=weight_dtype)).sum()#.mean()
                     for i in range(pred.shape[-2]):
-                        lpips_loss += lpips_loss_fn(pred[..., i, :].squeeze(dim=-2).to(dtype=weight_dtype), 
-                                                    target[..., i, :].squeeze(dim=-2).to(dtype=weight_dtype)).sum()#.mean()
+                        lpips_loss += lpips_loss_fn(pred[:, :, :, i, :].to(dtype=weight_dtype), 
+                                                    target[:, :, :, i, :].to(dtype=weight_dtype)).sum()#.mean()
                     for i in range(pred.shape[-3]):
-                        lpips_loss += lpips_loss_fn(pred[..., i, :, :].squeeze(dim=-3).to(dtype=weight_dtype), 
-                                                    target[..., i, :, :].squeeze(dim=-3).to(dtype=weight_dtype)).sum()#.mean()
+                        lpips_loss += lpips_loss_fn(pred[:, :, i, :, :].to(dtype=weight_dtype), 
+                                                    target[:, :, i, :, :].to(dtype=weight_dtype)).sum()#.mean()
                     lpips_loss /= ((pred.shape[-1] + pred.shape[-2] + pred.shape[-3])*pred.shape[0])
                     
                     #lpips_loss = lpips_loss_fn(pred.to(dtype=weight_dtype), target).mean()
                     if not torch.isfinite(lpips_loss):
                         lpips_loss = torch.tensor(0)
 
-                loss = (
-                    mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss
-                )
+                if global_step > args.lr_warmup_steps:
+                    loss = (mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss)
+                else:
+                    loss = (mse_loss + args.lpips_scale * lpips_loss) # + args.kl_scale * kl_loss)
 
                 if not torch.isfinite(loss):
                     # pred_mean = pred.mean()
@@ -1184,17 +1191,17 @@ def main():
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch)
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved state to {save_path}")
+                    log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch)
 
             logs = {
                 "step_loss": loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
                 "mse_loss": mse_loss.detach().item(),
                 "lpips_loss": lpips_loss.detach().item(),
-                "kl_loss": kl_loss.detach().item(),
+                #"kl_loss": kl_loss.detach().item(),
             }
             accelerator.log(logs)
             progress_bar.set_postfix(**logs)
@@ -1202,110 +1209,110 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-    if accelerator.is_main_process:
+    #if accelerator.is_main_process:
     #if global_step % args.validation_epochs == 0: ### global_step
-        if args.use_ema:
-            # Store the VAE parameters temporarily and load the EMA parameters to perform inference.
-            ema_vae.store(vae.parameters())
-            ema_vae.copy_to(vae.parameters())
+    if args.use_ema:
+        # Store the VAE parameters temporarily and load the EMA parameters to perform inference.
+        ema_vae.store(vae.parameters())
+        ema_vae.copy_to(vae.parameters())
 
-        if args.slicing:
-            vae.disable_slicing()
-        if args.tiling:
-            vae.disable_tiling()
+    if args.slicing:
+        vae.disable_slicing()
+    if args.tiling:
+        vae.disable_tiling()
 
-        with torch.no_grad():
-            vae.eval()
-            valid_loss = 0.0
-            for step, batch in enumerate(test_dataloader):
-                with accelerator.accumulate(vae):
-                    target = batch["pixel_values"] #.to(memory_format=torch.channels_last_3d) #.to(weight_dtype) ###
+    with torch.no_grad():
+        vae.eval()
+        valid_loss = 0.0
+        for step, batch in enumerate(test_dataloader):
+            with accelerator.accumulate(vae):
+                target = batch["pixel_values"].to(weight_dtype) #.to(memory_format=torch.channels_last_3d) #.to(weight_dtype) ###
 
-                    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoder_kl.py
-                    if accelerator.num_processes > 1:
-                        posterior = vae.module.encode(target).latent_dist
-                    else:
-                        posterior = vae.encode(target).latent_dist # code run this line
-                    
-                    # z = mean                      if posterior.mode()
-                    # z = mean + variable*epsilon   if posterior.sample()
-                    z = posterior.sample() # Not mode()
-                    if accelerator.num_processes > 1:
-                        pred = vae.module.decode(z).sample
-                    else:
-                        pred = vae.decode(z).sample
+                # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoder_kl.py
+                if accelerator.num_processes > 1:
+                    posterior = vae.module.encode(target).latent_dist
+                else:
+                    posterior = vae.encode(target).latent_dist # code run this line
+                
+                # z = mean                      if posterior.mode()
+                # z = mean + variable*epsilon   if posterior.sample()
+                z = posterior.sample() # Not mode()
+                if accelerator.num_processes > 1:
+                    pred = vae.module.decode(z).sample
+                else:
+                    pred = vae.decode(z).sample
 
-                    kl_loss = posterior.kl().mean()
-                    
-                    # if global_step > args.mse_start:
-                    #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                    # else:
-                    #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                    
-                    # print("### pred shape:", pred.shape, flush=True)
-                    # print("### target shape:", target.shape, flush=True)
+                kl_loss = posterior.kl().mean()
+                
+                # if global_step > args.mse_start:
+                #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                # else:
+                #     pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                
+                # print("### pred shape:", pred.shape, flush=True)
+                # print("### target shape:", target.shape, flush=True)
 
-                    pred = rgb_to_grayscale_3d(pred)
-                    target = rgb_to_grayscale_3d(target)
-                    
-                    mse_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                    
-                    #with torch.no_grad():
-                    # for i, (pre, tar) in enumerate(zip(pred, target)):
-                    lpips_loss = 0
-                    # print("### pred[..., i].squeeze(dim=-1) shape:", pred[..., 0].squeeze(dim=-1).shape)
-                    # print("### pred[..., i, :].squeeze(dim=-2) shape:", pred[..., 0, :].squeeze(dim=-2).shape)
-                    # print("### pred[..., i, :, :].squeeze(dim=-3) shape:", pred[..., 0, :, :].squeeze(dim=-3).shape)
-                    for i in range(pred.shape[-1]):
-                        lpips_loss += lpips_loss_fn(pred[..., i].squeeze(dim=-1).to(dtype=weight_dtype), 
-                                                    target[..., i].squeeze(dim=-1).to(dtype=weight_dtype)).sum()#.mean()
-                    for i in range(pred.shape[-2]):
-                        lpips_loss += lpips_loss_fn(pred[..., i, :].squeeze(dim=-2).to(dtype=weight_dtype), 
-                                                    target[..., i, :].squeeze(dim=-2).to(dtype=weight_dtype)).sum()#.mean()
-                    for i in range(pred.shape[-3]):
-                        lpips_loss += lpips_loss_fn(pred[..., i, :, :].squeeze(dim=-3).to(dtype=weight_dtype), 
-                                                    target[..., i, :, :].squeeze(dim=-3).to(dtype=weight_dtype)).sum()#.mean()
-                    lpips_loss /= ((pred.shape[-1] + pred.shape[-2] + pred.shape[-3])*pred.shape[0])
-                    
-                    #lpips_loss = lpips_loss_fn(pred.to(dtype=weight_dtype), target).mean()
-                    if not torch.isfinite(lpips_loss):
-                        lpips_loss = torch.tensor(0)
+                pred = rgb_to_grayscale_3d(pred)
+                target = rgb_to_grayscale_3d(target)
+                
+                mse_loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                
+                #with torch.no_grad():
+                # for i, (pre, tar) in enumerate(zip(pred, target)):
+                lpips_loss = 0
+                # print("### pred[..., i].squeeze(dim=-1) shape:", pred[..., 0].squeeze(dim=-1).shape)
+                # print("### pred[..., i, :].squeeze(dim=-2) shape:", pred[..., 0, :].squeeze(dim=-2).shape)
+                # print("### pred[..., i, :, :].squeeze(dim=-3) shape:", pred[..., 0, :, :].squeeze(dim=-3).shape)
+                for i in range(pred.shape[-1]):
+                    lpips_loss += lpips_loss_fn(pred[:, :, :, :, i].to(dtype=weight_dtype), 
+                                                target[:, :, :, :, i].to(dtype=weight_dtype)).sum()#.mean()
+                for i in range(pred.shape[-2]):
+                    lpips_loss += lpips_loss_fn(pred[:, :, :, i, :].to(dtype=weight_dtype), 
+                                                target[:, :, :, i, :].to(dtype=weight_dtype)).sum()#.mean()
+                for i in range(pred.shape[-3]):
+                    lpips_loss += lpips_loss_fn(pred[:, :, i, :, :].to(dtype=weight_dtype), 
+                                                target[:, :, i, :, :].to(dtype=weight_dtype)).sum()#.mean()
+                lpips_loss /= ((pred.shape[-1] + pred.shape[-2] + pred.shape[-3])*pred.shape[0])
+                
+                #lpips_loss = lpips_loss_fn(pred.to(dtype=weight_dtype), target).mean()
+                if not torch.isfinite(lpips_loss):
+                    lpips_loss = torch.tensor(0)
 
-                    loss = (
-                        mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss
-                    )
+                loss = (
+                    mse_loss + args.lpips_scale * lpips_loss + args.kl_scale * kl_loss
+                )
 
-                    if not torch.isfinite(loss):
-                        # pred_mean = pred.mean()
-                        # target_mean = target.mean()
-                        logger.info("\nWARNING: non-finite loss, ending validation ")
+                if not torch.isfinite(loss):
+                    # pred_mean = pred.mean()
+                    # target_mean = target.mean()
+                    logger.info("\nWARNING: non-finite loss, ending validation ")
 
-                    # Gather the losses across all processes for logging (if we use distributed training).
-                    avg_loss = accelerator.gather(loss.repeat(args.valid_batch_size)).mean()
-                    valid_loss += avg_loss.item() # / args.gradient_accumulation_steps
+                # Gather the losses across all processes for logging (if we use distributed training).
+                avg_loss = accelerator.gather(loss.repeat(args.valid_batch_size)).mean()
+                valid_loss += avg_loss.item() # / args.gradient_accumulation_steps
 
-                if accelerator.sync_gradients:
-                    if args.use_ema:
-                        ema_vae.step(vae.parameters())
-                    #progress_bar.update(1)
-                    #global_step += 1
-                    accelerator.log({"valid_loss": valid_loss}, step=global_step)
-                    valid_loss = 0.0
+            if accelerator.sync_gradients:
+                # if args.use_ema:
+                #     ema_vae.step(vae.parameters())
+                #progress_bar.update(1)
+                #global_step += 1
+                accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                valid_loss = 0.0
 
-            logs = {
-                "valid_step_loss": loss.detach().item(),
-                "valid_mse_loss": mse_loss.detach().item(),
-                "valid_lpips_loss": lpips_loss.detach().item(),
-                "valid_kl_loss": kl_loss.detach().item(),
-            }
-            accelerator.log(logs)
+        logs = {
+            "valid_step_loss": loss.detach().item(),
+            "valid_mse_loss": mse_loss.detach().item(),
+            "valid_lpips_loss": lpips_loss.detach().item(),
+            "valid_kl_loss": kl_loss.detach().item(),
+        }
+        accelerator.log(logs)
 
-        #with torch.no_grad():
-        #log_validation(args, repo_id, test_dataloader, vae, accelerator, weight_dtype, epoch)
-        log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch)
-        if args.use_ema:
-            # Switch back to the original UNet parameters.
-            ema_vae.restore(vae.parameters())
+    #with torch.no_grad():
+    #log_validation(args, repo_id, test_dataloader, vae, accelerator, weight_dtype, epoch)
+    log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch)
+    if args.use_ema:
+        # Switch back to the original parameters.
+        ema_vae.restore(vae.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

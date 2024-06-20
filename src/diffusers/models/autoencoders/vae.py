@@ -793,6 +793,7 @@ class DiagonalGaussianDistribution(object):
             return torch.Tensor([0.0])
         else:
             if other is None:
+                #print("### self.mean dim:", self.mean.shape)
                 return 0.5 * torch.sum(
                     torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
                     dim=[1, 2, 3, 4], ### consider depth
