@@ -1542,8 +1542,8 @@ class AttnProcessor2_0:
         input_ndim = hidden_states.ndim
 
         if input_ndim == 5: ###
-            batch_size, channel, height, width, depth = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width * depth).transpose(1, 2)
+            batch_size, channel, depth, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, depth * height * width).transpose(1, 2)
 
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -1591,7 +1591,7 @@ class AttnProcessor2_0:
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 5: ###
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width, depth)
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, depth, height, width)
 
         if attn.residual_connection:
             hidden_states = hidden_states + residual

@@ -400,7 +400,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         # 1. Input
         if self.is_input_continuous:
-            batch_size, _, height, width = hidden_states.shape
+            batch_size, _, depth, height, width = hidden_states.shape ### for ACS conv
             residual = hidden_states
             hidden_states, inner_dim = self._operate_on_continuous_inputs(hidden_states)
         elif self.is_input_vectorized:
@@ -453,6 +453,7 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
                 hidden_states=hidden_states,
                 residual=residual,
                 batch_size=batch_size,
+                depth=depth, ### for ACS conv
                 height=height,
                 width=width,
                 inner_dim=inner_dim,
@@ -474,17 +475,17 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         return Transformer2DModelOutput(sample=output)
 
-    def _operate_on_continuous_inputs(self, hidden_states):
-        batch, _, height, width = hidden_states.shape
+    def _operate_on_continuous_inputs(self, hidden_states): ### for ACS conv
+        batch, _, depth, height, width = hidden_states.shape
         hidden_states = self.norm(hidden_states)
 
         if not self.use_linear_projection:
-            hidden_states = self.proj_in(hidden_states)
+            hidden_states = self.proj_in(hidden_states) # [2, 320, 16, 16, 16]
             inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+            hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(batch, depth * height * width, inner_dim)
         else:
             inner_dim = hidden_states.shape[1]
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+            hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(batch, depth * height * width, inner_dim)
             hidden_states = self.proj_in(hidden_states)
 
         return hidden_states, inner_dim
@@ -509,16 +510,16 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
 
         return hidden_states, encoder_hidden_states, timestep, embedded_timestep
 
-    def _get_output_for_continuous_inputs(self, hidden_states, residual, batch_size, height, width, inner_dim):
+    def _get_output_for_continuous_inputs(self, hidden_states, residual, batch_size, depth, height, width, inner_dim): ### for ACS conv
         if not self.use_linear_projection:
             hidden_states = (
-                hidden_states.reshape(batch_size, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+                hidden_states.reshape(batch_size, depth, height, width, inner_dim).permute(0, 4, 1, 2, 3).contiguous()
             )
             hidden_states = self.proj_out(hidden_states)
         else:
             hidden_states = self.proj_out(hidden_states)
             hidden_states = (
-                hidden_states.reshape(batch_size, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+                hidden_states.reshape(batch_size, depth, height, width, inner_dim).permute(0, 4, 1, 2, 3).contiguous()
             )
 
         output = hidden_states + residual

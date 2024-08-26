@@ -601,6 +601,7 @@ class StableDiffusionPipeline(
     def check_inputs(
         self,
         prompt,
+        depth, ###
         height,
         width,
         callback_steps,
@@ -611,8 +612,8 @@ class StableDiffusionPipeline(
         ip_adapter_image_embeds=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+        if depth % 8 != 0 or height % 8 != 0 or width % 8 != 0: ###
+            raise ValueError(f"`depth`and `height` and `width` have to be divisible by 8 but are {depth} and {height} and {width}.") ###
 
         if callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0):
             raise ValueError(
@@ -667,10 +668,11 @@ class StableDiffusionPipeline(
                     f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
                 )
 
-    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, batch_size, num_channels_latents, depth, height, width, dtype, device, generator, latents=None): ###
         shape = (
             batch_size,
             num_channels_latents,
+            int(depth) // self.vae_scale_factor, ###
             int(height) // self.vae_scale_factor,
             int(width) // self.vae_scale_factor,
         )
@@ -756,6 +758,7 @@ class StableDiffusionPipeline(
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
+        depth: Optional[int] = None, ###
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -788,6 +791,8 @@ class StableDiffusionPipeline(
         Args:
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+            depth (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`): ###
+                The depth in pixels of the generated image. ###
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -887,7 +892,8 @@ class StableDiffusionPipeline(
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
-        # 0. Default height and width to unet
+        # 0. Default depth and height and width to unet
+        depth = depth or self.unet.config.sample_size * self.vae_scale_factor ###
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
         # to deal with lora scaling and other possible forward hooks
@@ -895,6 +901,7 @@ class StableDiffusionPipeline(
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
+            depth, ###
             height,
             width,
             callback_steps,
@@ -964,6 +971,7 @@ class StableDiffusionPipeline(
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
+            depth, ###
             height,
             width,
             prompt_embeds.dtype,

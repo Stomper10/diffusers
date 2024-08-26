@@ -1472,12 +1472,10 @@ class DownEncoderBlock2D(nn.Module):
 
         for resnet in self.resnets:
             hidden_states = resnet(hidden_states, temb=None)
-        # print("### hidden_states shape:", hidden_states.shape, flush=True)
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
                 hidden_states = downsampler(hidden_states)
-                # print("### hidden_states after downsampler shape:", hidden_states.shape, flush=True)
 
         return hidden_states
 

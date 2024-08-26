@@ -270,7 +270,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         save_function: Optional[Callable] = None,
         safe_serialization: bool = True,
         variant: Optional[str] = None,
-        max_shard_size: Union[int, str] = "10GB",
+        max_shard_size: Union[int, str] = 1e+10,
         push_to_hub: bool = False,
         **kwargs,
     ):
