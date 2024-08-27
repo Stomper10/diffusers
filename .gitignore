@@ -178,7 +178,7 @@ tags
 wandb
 
 #sd3
-/sd3/script/*
-/sd3/results/*
-/labs/*
+sd3/script/*
+sd3/results/*
+labs
 

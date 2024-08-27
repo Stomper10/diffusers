@@ -1215,7 +1215,9 @@ def main():
                     ema_vae.step(vae.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                #accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    print("### train loss:", train_loss)
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
@@ -1349,14 +1351,16 @@ def main():
                     valid_loss += avg_loss.item() # / args.gradient_accumulation_steps
 
             if accelerator.sync_gradients:
-                accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                #accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    print("### valid loss:", valid_loss)
                 valid_loss = 0.0
 
         logs = {
             "valid_step_loss": loss.detach().item(),
             "valid_mse_loss": mse_loss.detach().item(),
             "valid_lpips_loss": lpips_loss.detach().item(),
-            "valid_kl_loss": kl_loss.detach().item(),
+            #"valid_kl_loss": kl_loss.detach().item(),
         }
         accelerator.log(logs)
 
