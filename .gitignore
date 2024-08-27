@@ -180,10 +180,3 @@ wandb
 # labs
 labs/_brain_ldm/results/*
 labs/_brain_ldm/script/*
-
-labs/acs_test.py
-labs/_brain_ldm/acs_test.py
-labs/_brain_ldm/test.py
-labs/_brain_ldm/train_unet_cond.py
-labs/_brain_ldm/min_snr_test.py
-
