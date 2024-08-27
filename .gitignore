@@ -180,3 +180,4 @@ wandb
 # labs
 labs/_brain_ldm/results/*
 labs/_brain_ldm/script/*
+sd3
