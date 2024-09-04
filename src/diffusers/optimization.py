@@ -224,7 +224,7 @@ def get_polynomial_decay_schedule_with_warmup(
     optimizer: Optimizer,
     num_warmup_steps: int,
     num_training_steps: int,
-    lr_end: float = 1e-7,
+    lr_end: float = 1e-15, ###
     power: float = 1.0,
     last_epoch: int = -1,
 ) -> LambdaLR:

@@ -182,7 +182,7 @@ def log_validation(input_size, vae, text_encoder, tokenizer, unet, args, acceler
 
         with autocast_ctx:
             image = pipeline(args.validation_prompts[i], 
-                             num_inference_steps=50, 
+                             num_inference_steps=200, 
                              generator=generator,
                              output_type="pt").images[0]
         
@@ -211,29 +211,29 @@ def log_validation(input_size, vae, text_encoder, tokenizer, unet, args, acceler
     return images
 
 
-def rgb_to_grayscale_3d(voxel_image):
-    """
-    Convert a 3D voxel image from RGB to grayscale.
+# def rgb_to_grayscale_3d(voxel_image):
+#     """
+#     Convert a 3D voxel image from RGB to grayscale.
     
-    Args:
-    - voxel_image (torch.Tensor): The input tensor with shape (batch_size, 3, depth, height, width)
+#     Args:
+#     - voxel_image (torch.Tensor): The input tensor with shape (batch_size, 3, depth, height, width)
     
-    Returns:
-    - torch.Tensor: The grayscale voxel image with shape (batch_size, 1, depth, height, width)
-    """
-    if voxel_image.shape[1] != 3:
-        raise ValueError("Input voxel image must have 3 channels (RGB).")
+#     Returns:
+#     - torch.Tensor: The grayscale voxel image with shape (batch_size, 1, depth, height, width)
+#     """
+#     if voxel_image.shape[1] != 3:
+#         raise ValueError("Input voxel image must have 3 channels (RGB).")
     
-    # Define the RGB to grayscale conversion weights
-    weights = torch.tensor([0.2989, 0.5870, 0.1140], dtype=torch.float16, device=voxel_image.device)
+#     # Define the RGB to grayscale conversion weights
+#     weights = torch.tensor([0.2989, 0.5870, 0.1140], dtype=torch.float16, device=voxel_image.device)
     
-    # Reshape weights for broadcasting
-    weights = weights.view(1, 3, 1, 1, 1)
+#     # Reshape weights for broadcasting
+#     weights = weights.view(1, 3, 1, 1, 1)
     
-    # Apply the weights to the RGB channels
-    grayscale_image = (voxel_image * weights).sum(dim=1, keepdim=True)
+#     # Apply the weights to the RGB channels
+#     grayscale_image = (voxel_image * weights).sum(dim=1, keepdim=True)
     
-    return grayscale_image
+#     return grayscale_image
 
 
 
@@ -353,7 +353,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=str,
-        default="160,224,160",#512,
+        default="128,128",#512,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -637,6 +637,10 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+
+    if args.report_to == "wandb" and accelerator.is_main_process: ###
+        wandb.init(project=args.tracker_project_name, resume=True) ###
+
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -685,26 +689,63 @@ def main():
     # frozen models from being partitioned during `zero.Init` which gets called during
     # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
-    with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        text_encoder = CLIPTextModel.from_pretrained(
+    # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+    #     text_encoder = CLIPTextModel.from_pretrained(
+    #         #"/shared/s1/lab06/wonyoung/diffusers/labs/_brain_ldm/results/TI_testrun2/checkpoint-3000", subfolder="text_encoder", use_safetensors=True
+    #         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    #     )
+    #     vae = AutoencoderKL.from_pretrained( ### set to pretrained ACS-VAE model path
+    #         args.pretrained_vae_path, subfolder="vae", 
+    #     )
+    #     if args.tiling and args.tile_sample_size:
+    #         vae.tile_sample_min_size = args.tile_sample_size
+    #         vae.tile_latent_min_size = int(args.tile_sample_size / 8) ### hard-coded assuming config sample size is 512
+    #     vae = ACSConverter(vae) #.to(accelerator.device) ###
+    #     #vae.to(memory_format=torch.channels_last) ###
+    #     print("### VAE ACS applied ###", flush=True)
+
+    text_encoder = CLIPTextModel.from_pretrained(
             #"/shared/s1/lab06/wonyoung/diffusers/labs/_brain_ldm/results/TI_testrun2/checkpoint-3000", subfolder="text_encoder", use_safetensors=True
             args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-        )
-        vae = AutoencoderKL.from_pretrained( ### set to pretrained ACS-VAE model path
-            args.pretrained_vae_path, subfolder="vae", 
-        )
-        if args.tiling and args.tile_sample_size:
-            vae.tile_sample_min_size = args.tile_sample_size
-            vae.tile_latent_min_size = int(args.tile_sample_size / 8) ### hard-coded assuming config sample size is 512
-        vae = ACSConverter(vae) #.to(accelerator.device) ###
-        #vae.to(memory_format=torch.channels_last) ###
-        print("### VAE ACS applied ###", flush=True)
+        ).to(accelerator.device)
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision, variant=args.variant
-    )
-    unet = ACSConverter(unet).to(accelerator.device) ###
-    print("### UNET ACS applied ###", flush=True)
+    input_size = tuple(int(x) for x in args.resolution.split(","))
+
+    vae = AutoencoderKL.from_pretrained( ### set to pretrained ACS-VAE model path
+            args.pretrained_vae_path, subfolder="vae", 
+        ).to(accelerator.device)
+
+    unet = UNet2DConditionModel(
+        sample_size=int(input_size[0] / (2 ** (len(vae.config.block_out_channels) - 1))),
+        act_fn="silu",
+        attention_head_dim=8,
+        block_out_channels=(320, 640, 1280, 1280),
+        center_input_sample=False,
+        cross_attention_dim=768,
+        down_block_types=(
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+            "DownBlock2D"
+        ),
+        downsample_padding=1,
+        flip_sin_to_cos=True,
+        freq_shift=0,
+        in_channels=4,
+        layers_per_block=2,
+        mid_block_scale_factor=1,
+        norm_eps=1e-05,
+        norm_num_groups=32,
+        out_channels=4,
+        up_block_types=(
+            "UpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D"
+        )
+    ).to(accelerator.device)
+    #unet = ACSConverter(unet).to(accelerator.device) ###
+    #print("### UNET ACS applied ###", flush=True)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -713,15 +754,45 @@ def main():
 
     # Create EMA for the unet.
     if args.use_ema:
-        try:
-            ema_unet = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        # try:
+        #     ema_unet = UNet2DConditionModel.from_pretrained(
+        #         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        #     )
+        #     ema_unet = ACSConverter(ema_unet) ###
+        #     print("### ACS applied ema ###", flush=True) ###
+        # except:
+        #     ema_unet = UNet2DConditionModel.from_pretrained(
+        #         args.pretrained_model_name_or_path, revision=args.revision, variant=args.variant)
+        # ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+        ema_unet = UNet2DConditionModel(
+            sample_size=int(input_size[0] / (2 ** (len(vae.config.block_out_channels) - 1))),
+            act_fn="silu",
+            attention_head_dim=8,
+            block_out_channels=(320, 640, 1280, 1280),
+            center_input_sample=False,
+            cross_attention_dim=768,
+            down_block_types=(
+                "CrossAttnDownBlock2D",
+                "CrossAttnDownBlock2D",
+                "CrossAttnDownBlock2D",
+                "DownBlock2D"
+            ),
+            downsample_padding=1,
+            flip_sin_to_cos=True,
+            freq_shift=0,
+            in_channels=4,
+            layers_per_block=2,
+            mid_block_scale_factor=1,
+            norm_eps=1e-05,
+            norm_num_groups=32,
+            out_channels=4,
+            up_block_types=(
+                "UpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D"
             )
-            ema_unet = ACSConverter(ema_unet) ###
-            print("### ACS applied ema ###", flush=True) ###
-        except:
-            ema_unet = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path, revision=args.revision, variant=args.variant)
+        )
         ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
 
     # `accelerate` 0.16.0 will have better support for customized saving
@@ -851,7 +922,7 @@ def main():
             self.image_names = list(data_csv["id"])
             self.labels = np.array(data_csv["age"])
             self.labels = (self.labels - min(self.labels)) / (max(self.labels) - min(self.labels)) # min-max normalize
-            self.text = "a photo of a <MRI>"
+            self.text = " " #"a photo of a <MRI>"
             # print("images_names: ", len(self.image_names), self.image_names[-1])
             # print("labels: ", len(self.labels), self.labels[-1])
             self.transform = transform
@@ -883,10 +954,10 @@ def main():
             label = self.labels[index]
             #text = self.text
             # Load the image
-            image = np.load(os.path.join(self.data_dir, 'final_array_128_full_' + str(image_name) + '.npy')).astype(np.float16) # (128,128,128,1)
+            image = np.load(os.path.join(self.data_dir, 'final_array_128_full_' + str(image_name) + '.npy')).astype(np.float16)[:,64,:,:] # (128,128,1) # (128,128,128,1)
             #print("image shape:", image.shape)
             image = torch.from_numpy(image).type(torch.float16) ###
-            image = image.permute(3, 0, 1, 2) # (1,128,128,128)
+            image = image.permute(2, 0, 1) # (1,128,128,128)
             #image = np.load(os.path.join(self.data_dir, 'final_array_128_full_' + str(image_name) + '.npy')).astype(np.uint8)[:,64,:,0] # (128,128,128,1) -> (128,128)
             #image = Image.fromarray(image, "L")
             #image = image.repeat(3, 1, 1, 1) # (3,128,128,128)
@@ -903,7 +974,7 @@ def main():
             if self.transform:
                 sample = self.transform(sample) # (128,128) -> (1,160,160)
                 # sample["pixel_values"] = sample["pixel_values"][0,:,:,:] # pseudo color channel (64,64,64)
-            sample["pixel_values"] = sample["pixel_values"].repeat(3, 1, 1, 1)
+            # sample["pixel_values"] = sample["pixel_values"].repeat(3, 1, 1, 1)
             #image = torch.from_numpy(image).to(memory_format=torch.contiguous_format).float()
             #image = image.repeat(3, 1, 1, 1) # (1,160,160) -> (3,160,160)
             # age = torch.tensor(label, dtype=torch.float32)
@@ -917,7 +988,7 @@ def main():
             #print("sample dtype:", sample["pixel_values"].dtype)
             return sample
         
-    input_size = tuple(int(x) for x in args.resolution.split(","))
+    #input_size = tuple(int(x) for x in args.resolution.split(","))
 
     train_transforms = transforms.Compose(
         [
@@ -999,6 +1070,7 @@ def main():
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        pin_memory=True
     )
 
     test_dataloader = torch.utils.data.DataLoader(
@@ -1030,7 +1102,7 @@ def main():
     )
 
     if args.use_ema:
-        ema_unet.to(accelerator.device)
+        ema_unet.to(accelerator.device, dtype=torch.float16)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -1117,123 +1189,149 @@ def main():
 
 
     with torch.no_grad(): # for latent scaling
-        if args.slicing:
-            vae.enable_slicing()
-        if args.tiling:
-            vae.enable_tiling()
+        # if args.slicing:
+        #     # if accelerator.num_processes > 1:
+        #     #     vae.module.enable_slicing()
+        #     # else:
+        #     vae.enable_slicing()
+        # if args.tiling:
+        #     # if accelerator.num_processes > 1:
+        #     #     vae.module.enable_tiling()
+        #     # else:
+        #     vae.enable_tiling()
         first_batch = next(iter(train_dataloader))
+        # if accelerator.num_processes > 1:
+        #     latents_sample = vae.module.encode(first_batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+        # else:
         latents_sample = vae.encode(first_batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-        print("### latents.shape:", latents_sample.shape, flush=True) ###
+        #print("### latents.shape:", latents_sample.shape, flush=True) ###
         scaling_factor = 1 / torch.std(latents_sample)
-        print("### scaling_factor:", scaling_factor, flush=True) ###
+        if accelerator.is_main_process:
+            print("### scaling_factor:", scaling_factor, flush=True) ###
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
-        if args.slicing:
-            vae.enable_slicing()
-        if args.tiling:
-            vae.enable_tiling()
+        # if args.slicing:
+        #     # if accelerator.num_processes > 1:
+        #     #     vae.module.enable_slicing()
+        #     # else:
+        #     vae.enable_slicing()
+        # if args.tiling:
+        #     # if accelerator.num_processes > 1:
+        #     #     vae.module.enable_tiling()
+        #     # else:
+        #     vae.enable_tiling()
         train_loss = 0.0
+        logger.info(f"{epoch = }")
+
         for step, batch in enumerate(train_dataloader):
+            unet.train()
             start_time = time.time() ###
             with accelerator.accumulate(unet):
+                autocast_ctx = torch.autocast(accelerator.device.type)
+                with autocast_ctx:
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                print("### latents.shape:", latents.shape, flush=True) ###
-                latents = latents * scaling_factor #vae.config.scaling_factor
+                    # if accelerator.num_processes > 1:
+                    #     latents = vae.module.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                    # else:
+                    latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                    #print("### latents.shape:", latents.shape, flush=True) ###
+                    latents = latents * scaling_factor #vae.config.scaling_factor
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    if args.noise_offset:
+                        # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                        noise += args.noise_offset * torch.randn(
+                            (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        )
+                    if args.input_perturbation:
+                        new_noise = noise + args.input_perturbation * torch.randn_like(noise)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if args.input_perturbation:
-                    noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
-                else:
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    if args.input_perturbation:
+                        noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
+                    else:
+                        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
-                print("### encoder_hidden_states.shape:", encoder_hidden_states.shape, flush=True)
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                    #print("### encoder_hidden_states.shape:", encoder_hidden_states.shape, flush=True)
 
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    # Get the target for loss depending on the prediction type
+                    if args.prediction_type is not None:
+                        # set prediction_type of scheduler if defined
+                        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                if args.dream_training:
-                    noisy_latents, target = compute_dream_and_update_latents(
-                        unet,
-                        noise_scheduler,
-                        timesteps,
-                        noise,
-                        noisy_latents,
-                        target,
-                        encoder_hidden_states,
-                        args.dream_detail_preservation,
-                    )
-
-                # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
                     if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
+                        target = noise
                     elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                    if args.dream_training:
+                        noisy_latents, target = compute_dream_and_update_latents(
+                            unet,
+                            noise_scheduler,
+                            timesteps,
+                            noise,
+                            noisy_latents,
+                            target,
+                            encoder_hidden_states,
+                            args.dream_detail_preservation,
+                        )
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                    # Predict the noise residual and compute loss
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                    if args.snr_gamma is None:
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    else:
+                        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                        # This is discussed in Section 4.2 of the same paper.
+                        snr = compute_snr(noise_scheduler, timesteps)
+                        mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                            dim=1
+                        )[0]
+                        if noise_scheduler.config.prediction_type == "epsilon":
+                            mse_loss_weights = mse_loss_weights / snr
+                        elif noise_scheduler.config.prediction_type == "v_prediction":
+                            mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                        loss = loss.mean()
+
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+                    # Backpropagate
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
             end_time = time.time() ###
-            print(f"### Training step elasped: {end_time - start_time}", flush=True) ###
+            if accelerator.is_main_process:
+                print(f"### Training step elasped: {end_time - start_time}", flush=True) ###
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                #accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    print("### train loss:", train_loss)
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
@@ -1274,19 +1372,21 @@ def main():
                     )
 
                     # validation
+                    if accelerator.is_main_process:
+                        print("### Start validation ###")
                     start_time_valid = time.time() ###
                     with torch.no_grad():
-                        if args.slicing:
-                            vae.enable_slicing()
-                        if args.tiling:
-                            vae.enable_tiling()
+                        # if args.slicing:
+                        #     vae.enable_slicing()
+                        # if args.tiling:
+                        #     vae.enable_tiling()
                         unet.eval()
                         valid_loss = 0.0
                         for step, batch in enumerate(test_dataloader):
                             with accelerator.accumulate(unet):
                                 # Convert images to latent space
                                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                                print("### latents.shape:", latents.shape, flush=True) ###
+                                #print("### latents.shape:", latents.shape, flush=True)
                                 latents = latents * scaling_factor #vae.config.scaling_factor
 
                                 # Sample noise that we'll add to the latents
@@ -1341,7 +1441,7 @@ def main():
                                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
                                 if args.snr_gamma is None:
-                                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                                    val_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                                 else:
                                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -1355,19 +1455,26 @@ def main():
                                     elif noise_scheduler.config.prediction_type == "v_prediction":
                                         mse_loss_weights = mse_loss_weights / (snr + 1)
 
-                                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                                    loss = loss.mean()
+                                    val_loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                                    val_loss = val_loss.mean(dim=list(range(1, len(val_loss.shape)))) * mse_loss_weights
+                                    val_loss = val_loss.mean()
 
                                 # Gather the losses across all processes for logging (if we use distributed training).
-                                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                                valid_loss += avg_loss.item() / args.gradient_accumulation_steps
+                                val_avg_loss = accelerator.gather(val_loss.repeat(args.train_batch_size)).mean()
+                                valid_loss += val_avg_loss.item() / args.gradient_accumulation_steps
                         
                             if accelerator.sync_gradients:
-                                accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                                #accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                                if accelerator.is_main_process:
+                                    print("### valid loss:", valid_loss)
                                 valid_loss = 0.0
+
+                        logs = {"valid_step_loss": val_loss.detach().item()}
+                        accelerator.log(logs)
+                        
                     end_time_valid = time.time() ###
-                    print(f"### Validation step elasped: {end_time_valid - start_time_valid}", flush=True) ###
+                    if accelerator.is_main_process:
+                        print(f"### Validation step elasped: {end_time_valid - start_time_valid}", flush=True) ###
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             accelerator.log(logs) ###
@@ -1377,31 +1484,37 @@ def main():
                 break
 
         #if accelerator.is_main_process:
-        if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-            if args.use_ema:
-                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                ema_unet.store(unet.parameters())
-                ema_unet.copy_to(unet.parameters())
+        #if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+    if args.use_ema:
+        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+        ema_unet.store(unet.parameters())
+        ema_unet.copy_to(unet.parameters())
 
-            if args.slicing:
-                vae.disable_slicing()
-            if args.tiling:
-                vae.disable_tiling()
+    # if args.slicing:
+    #     # if accelerator.num_processes > 1:
+    #     #     vae.module.disable_slicing()
+    #     # else:
+    #     vae.disable_slicing()
+    # if args.tiling:
+    #     # if accelerator.num_processes > 1:
+    #     #     vae.module.disable_tiling()
+    #     # else:
+    #     vae.disable_tiling()
 
-            log_validation(
-                input_size,
-                vae,
-                text_encoder,
-                tokenizer,
-                unet,
-                args,
-                accelerator,
-                weight_dtype,
-                global_step,
-            )
-            if args.use_ema:
-                # Switch back to the original UNet parameters.
-                ema_unet.restore(unet.parameters())
+    # log_validation(
+    #     input_size,
+    #     vae,
+    #     text_encoder,
+    #     tokenizer,
+    #     unet,
+    #     args,
+    #     accelerator,
+    #     weight_dtype,
+    #     global_step,
+    # )
+    if args.use_ema:
+        # Switch back to the original UNet parameters.
+        ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -1420,41 +1533,38 @@ def main():
         )
         pipeline.save_pretrained(args.output_dir)
 
-        # Run a final round of inference.
-        images = []
-        if args.validation_prompts is not None:
-            logger.info("Running inference for collecting generated images...")
-            pipeline = pipeline.to(accelerator.device)
-            pipeline.torch_dtype = weight_dtype
-            pipeline.set_progress_bar_config(disable=True)
+        # # Run a final round of inference.
+        # images = []
+        # if args.validation_prompts is not None:
+        #     logger.info("Running inference for collecting generated images...")
+        #     pipeline = pipeline.to(accelerator.device)
+        #     pipeline.torch_dtype = weight_dtype
+        #     pipeline.set_progress_bar_config(disable=True)
 
-            if args.enable_xformers_memory_efficient_attention:
-                pipeline.enable_xformers_memory_efficient_attention()
+        #     if args.enable_xformers_memory_efficient_attention:
+        #         pipeline.enable_xformers_memory_efficient_attention()
 
-            if args.seed is None:
-                generator = None
-            else:
-                generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        #     if args.seed is None:
+        #         generator = None
+        #     else:
+        #         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-            for i in range(len(args.validation_prompts)):
-                with torch.autocast("cuda"):
-                    image = pipeline(args.validation_prompts[i], 
-                                     depth=input_size[0],
-                                     height=input_size[1],
-                                     width=input_size[2],
-                                     num_inference_steps=20, 
-                                     generator=generator,
-                                     output_type="pt").images[0]
-                images.append(image)
+        #     for i in range(len(args.validation_prompts)):
+        #         with torch.autocast("cuda"):
+        #             image = pipeline(args.validation_prompts[i], 
+        #                              num_inference_steps=50, 
+        #                              generator=generator,
+        #                              output_type="pt").images[0]
+        #         images.append(image)
 
-        if args.push_to_hub:
-            save_model_card(args, repo_id, images, repo_folder=args.output_dir)
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
+        # if args.push_to_hub:
+        #     save_model_card(args, repo_id, images, repo_folder=args.output_dir)
+        #     upload_folder(
+        #         repo_id=repo_id,
+        #         folder_path=args.output_dir,
+        #         commit_message="End of training",
+        #         ignore_patterns=["step_*", "epoch_*"],
+        #     )
 
     accelerator.end_training()
 
