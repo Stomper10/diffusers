@@ -187,7 +187,7 @@ def log_validation(input_size, vae, text_encoder, tokenizer, unet, args, acceler
                              depth=input_size[0],
                              height=input_size[1],
                              width=input_size[2],
-                             num_inference_steps=20, 
+                             num_inference_steps=100, 
                              generator=generator,
                              output_type="pt").images[0]
         
@@ -864,7 +864,7 @@ def main():
             self.image_names = list(data_csv["id"])
             self.labels = np.array(data_csv["age"])
             self.labels = (self.labels - min(self.labels)) / (max(self.labels) - min(self.labels)) # min-max normalize
-            self.text = "a photo of a <MRI>"
+            self.text = " "
             # print("images_names: ", len(self.image_names), self.image_names[-1])
             # print("labels: ", len(self.labels), self.labels[-1])
             self.transform = transform
@@ -1287,100 +1287,100 @@ def main():
                     )
 
                     # validation
-                    start_time_valid = time.time() ###
-                    with torch.no_grad():
-                        if args.slicing:
-                            vae.enable_slicing()
-                        if args.tiling:
-                            vae.enable_tiling()
-                        unet.eval()
-                        valid_loss = 0.0
-                        for step, batch in enumerate(test_dataloader):
-                            with accelerator.accumulate(unet):
-                                # Convert images to latent space
-                                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                                print("### latents.shape:", latents.shape, flush=True) ###
-                                latents = latents * scaling_factor #vae.config.scaling_factor
+                    # start_time_valid = time.time() ###
+                    # with torch.no_grad():
+                    #     if args.slicing:
+                    #         vae.enable_slicing()
+                    #     if args.tiling:
+                    #         vae.enable_tiling()
+                    #     unet.eval()
+                    #     valid_loss = 0.0
+                    #     for step, batch in enumerate(test_dataloader):
+                    #         with accelerator.accumulate(unet):
+                    #             # Convert images to latent space
+                    #             latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                    #             print("### latents.shape:", latents.shape, flush=True) ###
+                    #             latents = latents * scaling_factor #vae.config.scaling_factor
 
-                                # Sample noise that we'll add to the latents
-                                noise = torch.randn_like(latents)
-                                if args.noise_offset:
-                                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                                    noise += args.noise_offset * torch.randn(
-                                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                                    )
-                                if args.input_perturbation:
-                                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                                bsz = latents.shape[0]
-                                # Sample a random timestep for each image
-                                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                                timesteps = timesteps.long()
+                    #             # Sample noise that we'll add to the latents
+                    #             noise = torch.randn_like(latents)
+                    #             if args.noise_offset:
+                    #                 # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    #                 noise += args.noise_offset * torch.randn(
+                    #                     (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    #                 )
+                    #             if args.input_perturbation:
+                    #                 new_noise = noise + args.input_perturbation * torch.randn_like(noise)
+                    #             bsz = latents.shape[0]
+                    #             # Sample a random timestep for each image
+                    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    #             timesteps = timesteps.long()
 
-                                # Add noise to the latents according to the noise magnitude at each timestep
-                                # (this is the forward diffusion process)
-                                if args.input_perturbation:
-                                    noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
-                                else:
-                                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    #             # Add noise to the latents according to the noise magnitude at each timestep
+                    #             # (this is the forward diffusion process)
+                    #             if args.input_perturbation:
+                    #                 noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
+                    #             else:
+                    #                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                                # Get the text embedding for conditioning
-                                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                    #             # Get the text embedding for conditioning
+                    #             encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
-                                # Get the target for loss depending on the prediction type
-                                if args.prediction_type is not None:
-                                    # set prediction_type of scheduler if defined
-                                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    #             # Get the target for loss depending on the prediction type
+                    #             if args.prediction_type is not None:
+                    #                 # set prediction_type of scheduler if defined
+                    #                 noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
-                                if noise_scheduler.config.prediction_type == "epsilon":
-                                    target = noise
-                                elif noise_scheduler.config.prediction_type == "v_prediction":
-                                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                                else:
-                                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    #             if noise_scheduler.config.prediction_type == "epsilon":
+                    #                 target = noise
+                    #             elif noise_scheduler.config.prediction_type == "v_prediction":
+                    #                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    #             else:
+                    #                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                                if args.dream_training:
-                                    noisy_latents, target = compute_dream_and_update_latents(
-                                        unet,
-                                        noise_scheduler,
-                                        timesteps,
-                                        noise,
-                                        noisy_latents,
-                                        target,
-                                        encoder_hidden_states,
-                                        args.dream_detail_preservation,
-                                    )
+                    #             if args.dream_training:
+                    #                 noisy_latents, target = compute_dream_and_update_latents(
+                    #                     unet,
+                    #                     noise_scheduler,
+                    #                     timesteps,
+                    #                     noise,
+                    #                     noisy_latents,
+                    #                     target,
+                    #                     encoder_hidden_states,
+                    #                     args.dream_detail_preservation,
+                    #                 )
 
-                                # Predict the noise residual and compute loss
-                                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                    #             # Predict the noise residual and compute loss
+                    #             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
-                                if args.snr_gamma is None:
-                                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                                else:
-                                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                                    # This is discussed in Section 4.2 of the same paper.
-                                    snr = compute_snr(noise_scheduler, timesteps)
-                                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                                        dim=1
-                                    )[0]
-                                    if noise_scheduler.config.prediction_type == "epsilon":
-                                        mse_loss_weights = mse_loss_weights / snr
-                                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                                        mse_loss_weights = mse_loss_weights / (snr + 1)
+                    #             if args.snr_gamma is None:
+                    #                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    #             else:
+                    #                 # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    #                 # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    #                 # This is discussed in Section 4.2 of the same paper.
+                    #                 snr = compute_snr(noise_scheduler, timesteps)
+                    #                 mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                    #                     dim=1
+                    #                 )[0]
+                    #                 if noise_scheduler.config.prediction_type == "epsilon":
+                    #                     mse_loss_weights = mse_loss_weights / snr
+                    #                 elif noise_scheduler.config.prediction_type == "v_prediction":
+                    #                     mse_loss_weights = mse_loss_weights / (snr + 1)
 
-                                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                                    loss = loss.mean()
+                    #                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    #                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    #                 loss = loss.mean()
 
-                                # Gather the losses across all processes for logging (if we use distributed training).
-                                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                                valid_loss += avg_loss.item() / args.gradient_accumulation_steps
+                    #             # Gather the losses across all processes for logging (if we use distributed training).
+                    #             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    #             valid_loss += avg_loss.item() / args.gradient_accumulation_steps
                         
-                            if accelerator.sync_gradients:
-                                accelerator.log({"valid_loss": valid_loss}, step=global_step)
-                                valid_loss = 0.0
-                    end_time_valid = time.time() ###
-                    print(f"### Validation step elasped: {end_time_valid - start_time_valid}", flush=True) ###
+                    #         if accelerator.sync_gradients:
+                    #             accelerator.log({"valid_loss": valid_loss}, step=global_step)
+                    #             valid_loss = 0.0
+                    # end_time_valid = time.time() ###
+                    # print(f"### Validation step elasped: {end_time_valid - start_time_valid}", flush=True) ###
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             accelerator.log(logs) ###
@@ -1455,7 +1455,7 @@ def main():
                                      depth=input_size[0],
                                      height=input_size[1],
                                      width=input_size[2],
-                                     num_inference_steps=20, 
+                                     num_inference_steps=100, 
                                      generator=generator,
                                      output_type="pt").images[0]
                 images.append(image)
