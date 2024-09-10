@@ -30,6 +30,8 @@ import datasets
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+from torchsummary import summary
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -75,7 +77,7 @@ DATASET_NAME_MAPPING = {
 }
 
 torch.backends.cudnn.benchmark = True ###
-
+nb_acts, nb_inputs, nb_params = 0, 0, 0
 
 def save_model_card(
     args,
@@ -1062,6 +1064,36 @@ def main():
     lpips_loss_fn.requires_grad_(False)
 
     #accelerator.init_deepspeed() ###
+
+
+    #################### Model check #####################
+
+
+    # autoencoder memory check
+    def count_output_act(m, input, output):
+        global nb_acts
+        nb_acts += output.nelement()
+
+    for module in vae.modules():
+        if isinstance(module, nn.Conv3d) or isinstance(module, nn.Linear) or isinstance(module, nn.GroupNorm):
+            module.register_forward_hook(count_output_act)
+
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    nb_params = sum([p.nelement() for p in vae.parameters()])
+
+    vae_input = torch.ones(1, 3, 64, 64, 64).float().to(accelerator.device) # 716,800
+    vae.eval() # 13,766,248
+    encoded = vae(vae_input)
+    nb_inputs = vae_input.nelement()
+
+    print('input elem: {}, param elem: {}, forward act: {}, mem usage: {}GB'.format(
+        nb_inputs, nb_params, nb_acts, (nb_inputs+nb_params+nb_acts)*4/1024**3))
+    print("{:.2f} GB".format(torch.cuda.memory_allocated() / 1024 ** 3))
+    print("Autoencdoer parameters:", count_parameters(vae))
+    summary(vae, (3, 64, 64, 64))
+    # summary(vae, 3, 64, 64, 64)
+
 
     for epoch in range(first_epoch, args.num_train_epochs):
         vae.train()
