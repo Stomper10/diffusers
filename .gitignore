@@ -180,5 +180,7 @@ wandb
 #sd3
 sd3/script/*
 sd3/results/*
+sd3/temp/*
+src/diffusers/models/vq_gan_3d/cache/*
 labs
 
