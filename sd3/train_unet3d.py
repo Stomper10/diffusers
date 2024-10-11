@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-TODO: Calculate memory consumption for model switching / upload & offload, etc
+TODO: Diffusers scheduler? SD3? (flow matching)
 """
 
 import os
@@ -34,6 +34,7 @@ from packaging import version
 from tqdm.auto import tqdm
 from monai import transforms
 from torchsummary import summary
+from einops_exts import check_shape #, rearrange_many
 #from PIL import Image
 #from pathlib import Path
 #from omegaconf import OmegaConf
@@ -62,12 +63,14 @@ from diffusers.optimization import get_scheduler
 #from diffusers.utils.torch_utils import is_compiled_module
 #from diffusers import AutoencoderKL
 
-#from diffusers.training_utils import EMAModel #,compute_snr
+from diffusers.training_utils import EMAModel #,compute_snr
 #from diffusers.utils.import_utils import is_xformers_available
 #from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 
-from diffusers.models.vq_gan_3d import VQGAN, LPIPS, NLayerDiscriminator, NLayerDiscriminator3D
-from diffusers.models.vq_gan_3d.vqgan import hinge_d_loss, vanilla_d_loss
+from diffusers.models.vq_gan_3d import VQGAN #, LPIPS, NLayerDiscriminator, NLayerDiscriminator3D
+from diffusers.models.ddpm import Unet3D, GaussianDiffusion
+from diffusers.models.ddpm.diffusion import default, is_list_str
+from diffusers.models.ddpm.text import tokenize, bert_embed #, BERT_MODEL_DIM
 #from diffusers.models.vq_gan_3d.utils import adopt_weight
 
 if is_wandb_available():
@@ -78,18 +81,26 @@ check_min_version("0.28.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 @torch.no_grad()
-def log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch):
+def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, num_samples):
     logger.info("Running validation... ")
-    vae_model = accelerator.unwrap_model(vae)
+    vae = accelerator.unwrap_model(vae)
+    unet3d = accelerator.unwrap_model(unet3d)
 
     images = []
-    for i, sample in enumerate(test_dataloader):
-        if i == 5: # log 10 image pairs (bs=2)
-            break
-        with torch.autocast(accelerator.device.type, dtype=weight_dtype):
-            x = sample["pixel_values"].to(weight_dtype)
-            x_recon, _ = vae_model(x)
-        images.append(torch.cat([x.cpu(), x_recon.cpu()], axis=0)) #.cpu()
+    with torch.autocast(accelerator.device.type, dtype=weight_dtype):
+        for i in range(num_samples):
+            image = noise_scheduler.sample(vae=vae,
+                                        unet=unet3d,
+                                        image_size=int(input_size[0] / vae.config.downsample[0]),
+                                        num_frames=int(input_size[1] / vae.config.downsample[1]),
+                                        channels=int(vae.config.embedding_dim),
+                                        cond=None,
+                                        batch_size=1
+                                        )
+            images.append(image)
+        x = next(iter(test_dataloader))["pixel_values"][:num_samples]
+    
+    images = torch.stack([x.cpu(), torch.cat(images, dim=0).cpu()], dim=1)
 
     for tracker in accelerator.trackers:
         tracker.name = "wandb"
@@ -97,17 +108,33 @@ def log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch):
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, epoch)
         elif tracker.name == "wandb":
+            # tracker.log(
+            #     {
+            #         "validation Sagittal": [
+            #             wandb.Image(image[:, :, image.shape[2] // 2, :, :].squeeze(), caption=f"{i}: Uncond generation.")
+            #             for i, image in enumerate(images)
+            #         ],
+            #         "validation Coronal": [
+            #             wandb.Image(image[:, :, :, image.shape[3] // 2, :].squeeze(), caption=f"{i}: Uncond generation.")
+            #             for i, image in enumerate(images)
+            #         ],
+            #         "validation Axial": [
+            #             wandb.Image(image[:, :, :, :, image.shape[4] // 2].squeeze(), caption=f"{i}: Uncond generation.")
+            #             for i, image in enumerate(images)
+            #         ]
+            #     }
+            # )
             tracker.log(
                 {
-                    "Original (left), Reconstruction (right) - 1": [
+                    "Original (left), Generation (right) - Sagittal": [
                         wandb.Image(torchvision.utils.make_grid(image[:, :, image.shape[2] // 2, :, :]).permute(1, 2, 0))
                         for _, image in enumerate(images)
                     ],
-                    "Original (left), Reconstruction (right) - 2": [
+                    "Original (left), Generation (right) - Coronal": [
                         wandb.Image(torchvision.utils.make_grid(image[:, :, :, image.shape[3] // 2, :]).permute(1, 2, 0))
                         for _, image in enumerate(images)
                     ],
-                    "Original (left), Reconstruction (right) - 3": [
+                    "Original (left), Generation (right) - Axial": [
                         wandb.Image(torchvision.utils.make_grid(image[:, :, :, :, image.shape[4] // 2]).permute(1, 2, 0))
                         for _, image in enumerate(images)
                     ]
@@ -116,11 +143,11 @@ def log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch):
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
-    del vae_model
+    del vae
     del images
     torch.cuda.empty_cache()
 
-def count_activations(model, dummy_input):
+def count_activations(model, dummy_input, time):
     activations = []
     def hook_fn(module, input, output):
         # Add the number of elements in the output to the activations list
@@ -137,7 +164,7 @@ def count_activations(model, dummy_input):
     
     # Forward pass through the model
     with torch.no_grad():
-        model(dummy_input)
+        model(dummy_input, time=time)
     
     # Remove all the hooks
     for hook in hooks:
@@ -197,8 +224,10 @@ def count_parameters(model):
     return param_count
 
 
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="VQ-GAN training script.")
+    parser = argparse.ArgumentParser(description="UNET3D training script.")
     # parser.add_argument(
     #     "--revision",
     #     type=str,
@@ -212,6 +241,23 @@ def parse_args():
     #     default=None,
     #     help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     # )
+    parser.add_argument(
+        "--pretrained_vae_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--loss_type", type=str, default="l1", help="Loss type: l1 or l2."
+    )
+    parser.add_argument(
+        "--num_timesteps", type=int, default=1000, help="The number of diffusion steps."
+    )
+    parser.add_argument(
+        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+    )
+    parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -315,13 +361,7 @@ def parse_args():
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate_ae",
-        type=float,
-        default=1e-4, # 1.5e-7, # Reference : Waifu-diffusion-v1-4 config # default=4.5e-8,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--learning_rate_disc",
+        "--learning_rate",
         type=float,
         default=1e-4, # 1.5e-7, # Reference : Waifu-diffusion-v1-4 config # default=4.5e-8,
         help="Initial learning rate (after the potential warmup period) to use.",
@@ -345,9 +385,6 @@ def parse_args():
     #     "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler.",
     # )
     parser.add_argument(
-        "--discriminator_iter_start", type=int, default=10000, help="Number of steps for the warmup before start training discriminator.",
-    )
-    parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
@@ -358,7 +395,7 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
-    # parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     # parser.add_argument(
     #     "--non_ema_revision",
     #     type=str,
@@ -463,6 +500,7 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument("--num_samples", type=int, default=5, help="The number of samples for validation.")
     # parser.add_argument(
     #     "--kl_scale",
     #     type=float,
@@ -539,7 +577,7 @@ class UKB_Dataset(Dataset):
         # Load the image
         image = np.load(os.path.join(self.data_dir, 'final_array_128_full_' + str(image_name) + '.npy')).astype(np.float16) # (128,128,128,1)
         image = torch.from_numpy(image).type(torch.float16) ###
-        image = image.permute(3, 2, 0, 1) # (1,128,128,128)
+        image = image.permute(3, 0, 1, 2) # (1,128,128,128)
         sample = dict()
         sample["pixel_values"] = image
         del image
@@ -552,6 +590,7 @@ class UKB_Dataset(Dataset):
 
 def main():
     args = parse_args()
+    input_size = tuple(int(x) for x in args.resolution.split(","))
 
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -615,33 +654,44 @@ def main():
         #         repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
         #     ).repo_id
 
-    # Load VQ-GAN
-    vae = VQGAN(
-        embedding_dim=8,
-        n_codes=16384,
-        n_hiddens=16,
-        downsample=(2,2,2),
-        image_channels=1,
-        restart_thres=1.0,
-        no_random_restart=False,
-        norm_type="group",
-        padding_type="replicate",
-        num_groups=32,
+    # Load VAE & Unet3D
+    vae = VQGAN.from_pretrained( ### set to pretrained VQGAN model path
+        args.pretrained_vae_path, subfolder="vqgan", 
+    ).to(accelerator.device)
+    vae.requires_grad_(False)
+
+    unet3d = Unet3D(
+        dim=int(input_size[0] / vae.config.downsample[0]), # 32
+        dim_mults=(1,2,4,8),
+        channels=int(vae.config.embedding_dim) # 8
     ).to(accelerator.device)
 
-    image_discriminator = NLayerDiscriminator(
-        image_channels=1, 
-        disc_channels=64, 
-        disc_layers=3, 
-        norm_layer="BatchNorm2d"
-    ).to(accelerator.device)
+    # Create EMA for the unet.
+    if args.use_ema:
+        ema_unet3d = Unet3D(
+            dim=int(input_size[0] / vae.config.downsample[0]),
+            dim_mults=(1,2,4,8),
+            channels=int(vae.config.embedding_dim)
+        )
+        ema_unet3d = EMAModel(
+            ema_unet3d.parameters(), 
+            decay=0.995,
+            update_after_step=2000,
+            model_cls=Unet3D, 
+            model_config=ema_unet3d.config
+        )
 
-    video_discriminator = NLayerDiscriminator3D(
-        image_channels=1, 
-        disc_channels=64, 
-        disc_layers=3, 
-        norm_layer="BatchNorm3d"
-    ).to(accelerator.device)
+    noise_scheduler = GaussianDiffusion( # diffusers pipeline?
+        unet3d,
+        #vqgan_ckpt=cfg.model.vqgan_ckpt,
+        #image_size=cfg.model.diffusion_img_size,
+        #num_frames=cfg.model.diffusion_depth_size,
+        #channels=cfg.model.diffusion_num_channels,
+        timesteps=1000,
+        # sampling_timesteps=cfg.model.sampling_timesteps,
+        #loss_type=cfg.model.loss_type,
+        # objective=cfg.objective
+    ).to(accelerator.device) ###args
 
     # vae.train()
     # image_discriminator.train()
@@ -654,17 +704,13 @@ def main():
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                # if args.use_ema:
-                #     ema_vae.save_pretrained(os.path.join(output_dir, "vae_ema"))
+                if args.use_ema:
+                    ema_unet3d.save_pretrained(os.path.join(output_dir, "unet3d_ema"))
 
-                logger.info(f"{vae = }") # print model architecture
+                logger.info(f"{unet3d = }") # print model architecture
                 for _, model in enumerate(models):
-                    if isinstance(model, type(accelerator.unwrap_model(vae))):
-                        model.save_pretrained(os.path.join(output_dir, "vqgan"))
-                    elif isinstance(model, type(accelerator.unwrap_model(image_discriminator))):
-                        model.save_pretrained(os.path.join(output_dir, "image_discriminator"))
-                    elif isinstance(model, type(accelerator.unwrap_model(video_discriminator))):
-                        model.save_pretrained(os.path.join(output_dir, "video_discriminator"))
+                    if isinstance(model, type(accelerator.unwrap_model(unet3d))):
+                        model.save_pretrained(os.path.join(output_dir, "unet3d"))
                     else:
                         raise ValueError(f"unexpected save model: {model.__class__}")
                     
@@ -677,23 +723,19 @@ def main():
                 # weights.pop()
 
         def load_model_hook(models, input_dir):
-            # if args.use_ema:
-            #     load_model = EMAModel.from_pretrained(os.path.join(input_dir, "vae_ema"), AutoencoderKL)
-            #     ema_vae.load_state_dict(load_model.state_dict())
-            #     ema_vae.to(accelerator.device)
-            #     del load_model
+            if args.use_ema:
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet3d_ema"), Unet3D)
+                ema_unet3d.load_state_dict(load_model.state_dict())
+                ema_unet3d.to(accelerator.device)
+                del load_model
 
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
                 # load diffusers style into model
-                if isinstance(model, type(accelerator.unwrap_model(vae))):
-                    load_model = VQGAN.from_pretrained(input_dir, subfolder="vqgan")
-                elif isinstance(model, type(accelerator.unwrap_model(image_discriminator))):
-                    load_model = NLayerDiscriminator.from_pretrained(input_dir, subfolder="image_discriminator")
-                elif isinstance(model, type(accelerator.unwrap_model(video_discriminator))):
-                    load_model = NLayerDiscriminator3D.from_pretrained(input_dir, subfolder="video_discriminator")
+                if isinstance(model, type(accelerator.unwrap_model(unet3d))):
+                    load_model = Unet3D.from_pretrained(input_dir, subfolder="unet3d")
                 else:
                     raise ValueError(f"unexpected load model: {model.__class__}")
 
@@ -711,8 +753,8 @@ def main():
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if args.gradient_checkpointing:
-        vae.enable_gradient_checkpointing()
+    # if args.gradient_checkpointing:
+    #     vae.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -723,11 +765,8 @@ def main():
         torch.backends.cudnn.deterministic = False
 
     if args.scale_lr:
-        args.learning_rate_ae = (
-            args.learning_rate_ae * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
-        )
-        args.learning_rate_disc = (
-            args.learning_rate_disc * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Initialize the optimizer
@@ -742,20 +781,16 @@ def main():
     else:
         optimizer_cls = torch.optim.Adam #AdamW
 
-    optimizer_ae = optimizer_cls(list(vae.encoder.parameters()) +
-                                 list(vae.decoder.parameters()) +
-                                 list(vae.pre_vq_conv.parameters()) +
-                                 list(vae.post_vq_conv.parameters()) +
-                                 list(vae.codebook.parameters()),
-                                 lr=args.learning_rate_ae, 
-                                 betas=(args.adam_beta1, args.adam_beta2))
-    optimizer_disc = optimizer_cls(list(image_discriminator.parameters()) +
-                                   list(video_discriminator.parameters()),
-                                   lr=args.learning_rate_disc,
-                                   betas=(args.adam_beta1, args.adam_beta2))
+    # optimizer = optimizer_cls(
+    #     vae.parameters(),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+    optimizer = optimizer_cls(unet3d.parameters(), lr=args.learning_rate)
 
     # Load data
-    input_size = tuple(int(x) for x in args.resolution.split(","))
     train_transforms = transforms.Compose(
         [
             transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
@@ -797,18 +832,21 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler_ae = get_scheduler(
+    # lr_scheduler = get_scheduler(
+    #     args.lr_scheduler,
+    #     optimizer=optimizer,
+    # )
+    lr_scheduler = get_scheduler(
         args.lr_scheduler,
-        optimizer=optimizer_ae,
-    )
-    lr_scheduler_disc = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer_disc,
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        power=3.0
     )
 
     # Prepare everything with our `accelerator`.
-    vae, image_discriminator, video_discriminator, optimizer_ae, optimizer_disc, lr_scheduler_ae, lr_scheduler_disc, train_dataloader, test_dataloader = accelerator.prepare(
-        vae, image_discriminator, video_discriminator, optimizer_ae, optimizer_disc, lr_scheduler_ae, lr_scheduler_disc, train_dataloader, test_dataloader
+    unet3d, optimizer, lr_scheduler, train_dataloader, test_dataloader = accelerator.prepare(
+        unet3d, optimizer, lr_scheduler, train_dataloader, test_dataloader
     )
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -820,6 +858,11 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
+
+    # Move vae (and ema model) to gpu and cast to weight_dtype
+    vae.to(accelerator.device, dtype=weight_dtype)
+    if args.use_ema:
+        ema_unet3d.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -843,13 +886,13 @@ def main():
 
 
     # ------------------------------ TRAIN ------------------------------ #
-    #discriminator_iter_start: int = 50000,
-    args.disc_loss_type = "hinge"
-    args.image_gan_weight = 1.0
-    args.video_gan_weight = 1.0
-    args.l1_weight = 4.0
-    args.gan_feat_weight = 4.0
-    args.perceptual_weight = 4.0
+    #args.num_timesteps = 1000
+    #args.loss_type = "l1"
+    # args.image_gan_weight = 1.0
+    # args.video_gan_weight = 1.0
+    # args.l1_weight = 4.0
+    # args.gan_feat_weight = 4.0
+    # args.perceptual_weight = 4.0
 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -905,247 +948,108 @@ def main():
     )
     progress_bar.set_description("Steps")
 
-    #lpips_loss_fn = lpips.LPIPS(net="alex").to(accelerator.device, dtype=weight_dtype)
-    #lpips_loss_fn.requires_grad_(False)
-    perceptual_model = LPIPS().to(accelerator.device, dtype=weight_dtype).eval()
-    if args.disc_loss_type == 'vanilla':
-        disc_loss = vanilla_d_loss
-    elif args.disc_loss_type == 'hinge':
-        disc_loss = hinge_d_loss
-
     # Model memory check
-    dummy_input = torch.ones(1, 1, input_size[0], input_size[1], input_size[2]).float().to(accelerator.device) # 262,144 for 64^3
-    vae.eval()
-    image_discriminator.eval()
-    video_discriminator.eval()
+    dummy_input = torch.ones(1, 8, 32, 32, 32).float().to(accelerator.device) # 262,144 for 64^3
+    timesteps = torch.randint(0, args.num_timesteps, (dummy_input.shape[0],)).long().to(accelerator.device)
+    unet3d.eval()
 
-    vae_activations = count_activations(vae, dummy_input)
-    image_disc_activations = count_activations(image_discriminator, dummy_input[:, :, input_size[0] // 2, :, :])
-    video_disc_activations = count_activations(video_discriminator, dummy_input)
-
-    print(f"### VQ-GAN's number of activations: {vae_activations:,}")
-    print(f"### image_disc's number of activations: {image_disc_activations:,}")
-    print(f"### video_dics's number of activations: {video_disc_activations:,}")
+    unet3d_activations = count_activations(unet3d, dummy_input, timesteps)
+    print(f"### UNET3D's number of activations: {unet3d_activations:,}")
     
     # Show model architecture and # of params
-    param_counts = count_parameters(vae)
-    print(f"### VQ-GAN's Total parameters: {param_counts['total']}")
-    print(f"### VQ-GAN's Trainable parameters: {param_counts['trainable']}")
-    print(f"### VQ-GAN's Non-trainable parameters: {param_counts['non_trainable']}")
-    print(f"### VQ-GAN's Parameters by layer type: {param_counts['by_layer_type']}")
+    param_counts = count_parameters(unet3d)
+    print(f"### UNET3D's Total parameters: {param_counts['total']}")
+    print(f"### UNET3D's Trainable parameters: {param_counts['trainable']}")
+    print(f"### UNET3D's Non-trainable parameters: {param_counts['non_trainable']}")
+    print(f"### UNET3D's Parameters by layer type: {param_counts['by_layer_type']}")
+    # summary(unet3d, (8, 32, 32, 32))
+    # summary(unet3d, (8, 32, 32, 32, 32)) # assertion
     
-    param_counts = count_parameters(image_discriminator)
-    print(f"### image_disc's Total parameters: {param_counts['total']}")
-    print(f"### image_disc's Trainable parameters: {param_counts['trainable']}")
-    print(f"### image_disc's Non-trainable parameters: {param_counts['non_trainable']}")
-    print(f"### image_disc's Parameters by layer type: {param_counts['by_layer_type']}")
-
-    param_counts = count_parameters(video_discriminator)
-    print(f"### video_dics's Total parameters: {param_counts['total']}")
-    print(f"### video_dics's Trainable parameters: {param_counts['trainable']}")
-    print(f"### video_dics's Non-trainable parameters: {param_counts['non_trainable']}")
-    print(f"### video_dics's Parameters by layer type: {param_counts['by_layer_type']}")
-    
-    summary(vae, (1, input_size[0], input_size[1], input_size[2]))
-    summary(image_discriminator, (1, input_size[1], input_size[2]))
-    summary(video_discriminator, (1, input_size[0], input_size[1], input_size[2]))
-    #summary(video_discriminator, (1, 1, input_size[0], input_size[1], input_size[2])) # for assertion
-
     # Training
     if accelerator.is_main_process:
         print("### Start training ###")
     for epoch in range(first_epoch, args.num_train_epochs):
-        #train_loss = 0.0
+        
         logger.info(f"{epoch = }")
-
         for step, batch in enumerate(train_dataloader):
-            
             start_time = time.time()
+            unet3d.train()
 
-            if step % 2 == 0:
-                vae.train()
-                image_discriminator.eval()
-                video_discriminator.eval()
+            # Accumulate gradients
+            with accelerator.accumulate(unet3d):
+                with torch.autocast(accelerator.device.type, dtype=weight_dtype):
+                    x = batch["pixel_values"].to(weight_dtype)
 
-                # Accumulate gradients
-                with accelerator.accumulate(vae):
-                    with torch.autocast(accelerator.device.type, dtype=weight_dtype):
-                        x = batch["pixel_values"].to(weight_dtype)
-                        B, C, T, H, W = x.shape
-                        x_recon, vq_output = vae(x)
-
-                        # Compute reconstruction loss
-                        recon_loss = F.l1_loss(x_recon, x) * args.l1_weight
-                        # Compute commitment loss
-                        commitment_loss = vq_output['commitment_loss']
-
-                        # Selects one random 2D image from each 3D Image
-                        frame_idx = torch.randint(0, T, [B]).to(accelerator.device) #.cuda()
-                        frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
-                        frames = torch.gather(x, 2, frame_idx_selected).squeeze(2)
-                        frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)
-                        del frame_idx, frame_idx_selected
-
-                        with torch.no_grad():
-                            perceptual_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                            if args.perceptual_weight > 0:
-                                perceptual_loss = perceptual_model(frames, frames_recon).mean() * args.perceptual_weight
+                    with torch.no_grad():
+                        z = vae.encode(x, quantize=False, include_embeddings=True)
+                        # normalize to -1 and 1 (apply scaling factor)
+                        latents = ((z - vae.codebook.embeddings.min()) /
+                                   (vae.codebook.embeddings.max() -
+                                    vae.codebook.embeddings.min())) * 2.0 - 1.0
                         
-                        # Discriminator loss (turned on after a certain epoch)
-                        ae_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                        gan_feat_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                        g_image_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                        g_video_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                        image_gan_feat_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                        video_gan_feat_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-
-                        if global_step > args.discriminator_iter_start:
-                            with torch.no_grad():
-                                logits_image_fake, pred_image_fake = image_discriminator(frames_recon)
-                                logits_video_fake, pred_video_fake = video_discriminator(x_recon)
-                                g_image_loss = -torch.mean(logits_image_fake)
-                                g_video_loss = -torch.mean(logits_video_fake)
-                                ae_loss = args.image_gan_weight * g_image_loss + args.video_gan_weight * g_video_loss
-                                #disc_factor = adopt_weight(global_step, threshold=args.discriminator_iter_start)
-                                #aeloss = disc_factor * g_loss
-
-                                # GAN feature matching loss - tune features such that we get the same prediction result on the discriminator
-                                image_gan_feat_loss, video_gan_feat_loss = 0, 0
-                                feat_weights = 1 #4.0 / (3 + 1)
-                                if args.image_gan_weight > 0:
-                                    logits_image_real, pred_image_real = image_discriminator(frames)
-                                    for i in range(len(pred_image_fake)-1):
-                                        image_gan_feat_loss += feat_weights * \
-                                            F.l1_loss(pred_image_fake[i], pred_image_real[i].detach(
-                                            ))
-                                if args.video_gan_weight > 0:
-                                    logits_video_real, pred_video_real = video_discriminator(x)
-                                    for i in range(len(pred_video_fake)-1):
-                                        video_gan_feat_loss += feat_weights * \
-                                            F.l1_loss(pred_video_fake[i], pred_video_real[i].detach(
-                                            ))
-                                gan_feat_loss = args.gan_feat_weight * (image_gan_feat_loss + video_gan_feat_loss)
-                            
-                            del logits_image_fake, pred_image_fake, logits_video_fake, pred_video_fake
-                            del logits_image_real, pred_image_real, logits_video_real, pred_video_real
-                        
-                        del x_recon, frames, frames_recon
-
-                        loss = recon_loss + commitment_loss + ae_loss + perceptual_loss + gan_feat_loss
-                        #print("### GEN loss:", loss, flush=True) ###
-
-                        if not torch.isfinite(loss):
-                            logger.info("\nWARNING: non-finite loss.")
-                            continue
-                            
-                        optimizer_ae.zero_grad(set_to_none=True)
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
-                        optimizer_ae.step()
-                        lr_scheduler_ae.step()
-
-                        # if step % 50 == 0:
-                        logs = {
-                            "ae_step_loss": loss.detach().item(),
-                            "lr": lr_scheduler_ae.get_last_lr()[0],
-                            "perceptual_loss": perceptual_loss.detach().item(),
-                            "recon_loss": recon_loss.detach().item(),
-                            "commitment_loss": vq_output['commitment_loss'].detach().item(),
-                            "perplexity": vq_output['perplexity'].detach().item(),
-                            "g_image_loss": g_image_loss.detach().item(),
-                            "g_video_loss": g_video_loss.detach().item(),
-                            "ae_loss": ae_loss.detach().item(),
-                            "image_gan_feat_loss": image_gan_feat_loss.detach().item(),
-                            "video_gan_feat_loss": video_gan_feat_loss.detach().item(),
-                            "gan_feat_loss": gan_feat_loss.detach().item(),
-                        }
-                        accelerator.log(logs)
-
-            else: # Update Discriminators on odd steps
-                loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                d_image_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-                d_video_loss = torch.tensor(0.0, device=accelerator.device, dtype=weight_dtype)
-
-                if global_step > args.discriminator_iter_start:
-                    vae.eval()
-                    image_discriminator.train()
-                    video_discriminator.train()
-
-                    # Accumulate gradients
-                    with accelerator.accumulate(image_discriminator), accelerator.accumulate(video_discriminator):
-                        with torch.autocast(accelerator.device.type, dtype=weight_dtype):
-                            x = batch["pixel_values"].to(weight_dtype)
-                            B, C, T, H, W = x.shape
-                            with torch.no_grad():
-                                x_recon, vq_output = vae(x)
-                            del vq_output
-
-                            # Compute reconstruction loss
-                            #recon_loss = F.l1_loss(x_recon, x) * args.l1_weight
-
-                            # Selects one random 2D image from each 3D Image
-                            frame_idx = torch.randint(0, T, [B]).to(accelerator.device) #.cuda()
-                            frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
-                            frames = torch.gather(x, 2, frame_idx_selected).squeeze(2)
-                            frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)
+                    # print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
+                    B = latents.shape[0]
+                    check_shape(latents, 'b c f h w', 
+                                c=int(vae.config.embedding_dim), 
+                                f=int(input_size[0] / vae.config.downsample[0]), # saggital
+                                h=int(input_size[1] / vae.config.downsample[1]), # coronal
+                                w=int(input_size[2] / vae.config.downsample[2])) # axial
                     
-                            
-                            # Train discriminator
-                            logits_image_real, pred_image_real = image_discriminator(frames.detach())
-                            logits_video_real, pred_video_real = video_discriminator(x.detach())
+                    timesteps = torch.randint(0, args.num_timesteps, (B,), device=latents.device).long()
 
-                            logits_image_fake, pred_image_fake = image_discriminator(frames_recon.detach())
-                            logits_video_fake, pred_video_fake = video_discriminator(x_recon.detach())
+                    noise = torch.randn_like(latents)
+                    if args.noise_offset:
+                        # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                        noise += args.noise_offset * torch.randn(
+                            (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        )
+                    if args.input_perturbation:
+                        noise += args.input_perturbation * torch.randn_like(noise)
 
-                            d_image_loss = disc_loss(logits_image_real, logits_image_fake)
-                            d_video_loss = disc_loss(logits_video_real, logits_video_fake)
-                            #disc_factor = adopt_weight(global_step, threshold=args.discriminator_iter_start)
-                            discloss = args.image_gan_weight * d_image_loss + args.video_gan_weight * d_video_loss
-                            
-                            del x_recon, frames, frames_recon
-                            del logits_image_fake, pred_image_fake, logits_video_fake, pred_video_fake
-                            del logits_image_real, pred_image_real, logits_video_real, pred_video_real
+                    noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
 
-                            loss = discloss
-                            #print("### DISC loss:", loss, flush=True) ###
+                    cond = None # TODO: implement label conditioning embedding
+                    if is_list_str(cond):
+                        cond = bert_embed(tokenize(cond), return_cls_repr=False)
+                        cond = cond.to(latents.device)
 
-                            if not torch.isfinite(loss):
-                                logger.info("\nWARNING: non-finite loss.")
-                                continue
+                    z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond)
 
-                            optimizer_disc.zero_grad(set_to_none=True)
-                            accelerator.backward(loss)
-                            if accelerator.sync_gradients:
-                                disc_params = list(image_discriminator.parameters()) + list(video_discriminator.parameters())
-                                accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
-                            optimizer_disc.step()
-                            lr_scheduler_disc.step()
-                            
+                    if args.loss_type == 'l1':
+                        loss = F.l1_loss(noise, z_pred)
+                    elif args.loss_type == 'l2':
+                        loss = F.mse_loss(noise, z_pred)
+                    else:
+                        raise NotImplementedError()
+
+                    if not torch.isfinite(loss):
+                        logger.info("\nWARNING: non-finite loss.")
+                        continue
+                        
+                    optimizer.zero_grad(set_to_none=True)
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(unet3d.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+
+                    gathered_train_loss = accelerator.gather(loss)
+                    step_train_loss = gathered_train_loss.sum()
+
                 # if step % 50 == 0:
                 logs = {
-                "disc_step_loss": loss.detach().item(),
-                "lr": lr_scheduler_disc.get_last_lr()[0],
-                "d_image_loss": d_image_loss.detach().item(),
-                "d_video_loss": d_video_loss.detach().item(),
-                # "logits_image_real": logits_image_real.detach().item(),
-                # "logits_image_fake": logits_image_fake.detach().item(),
-                # "logits_video_real": logits_video_real.detach().item(),
-                # "logits_video_fake": logits_video_fake.detach().item(),
-                # "discloss": discloss.detach().item(),
+                    "unet_step_train_loss": step_train_loss.detach().item() / B,
+                    "lr": lr_scheduler.get_last_lr()[0],
                 }
                 accelerator.log(logs)
-                # else:
-                #     if accelerator.is_main_process:
-                #         print("### Discriminator not training yet ###")
 
-            end_time = time.time() ###
+            end_time = time.time()
             if accelerator.is_main_process:
                 print(f"### Training step elasped: {end_time - start_time}", flush=True)
 
             if accelerator.sync_gradients:
-            # if args.use_ema:
-            #     ema_vae.step(vae.parameters())
+                if args.use_ema:
+                    ema_unet3d.step(unet3d.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
@@ -1177,37 +1081,64 @@ def main():
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
                     logger.info(f"Saved state to {save_path}")
-                    log_validation(vae, test_dataloader, accelerator, weight_dtype, epoch)
+
+                    if args.use_ema:
+                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                        ema_unet3d.store(unet3d.parameters())
+                        ema_unet3d.copy_to(unet3d.parameters())
 
                     # validation
                     if accelerator.is_main_process:
                         print("### Start validation ###")
+                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, args.num_samples)
+                    
                     with torch.no_grad():
                         vae.eval()
-                        image_discriminator.eval()
-                        video_discriminator.eval()
+                        unet3d.eval()
                         valid_loss = 0.0
                         for step, batch in enumerate(test_dataloader):
                             with torch.autocast(accelerator.device.type, dtype=weight_dtype):
                                 x = batch["pixel_values"].to(weight_dtype)
-                                B, C, T, H, W = x.shape
-                                x_recon, val_vq_output = vae(x)
-                                #del val_vq_output
 
-                                val_recon_loss = F.l1_loss(x_recon, x) * args.l1_weight
-                                # Selects one random 2D image from each 3D Image
-                                frame_idx = torch.randint(0, T, [B]).to(accelerator.device) #.cuda()
-                                frame_idx_selected = frame_idx.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
-                                frames = torch.gather(x, 2, frame_idx_selected).squeeze(2)
-                                frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)
-
-                                val_perceptual_loss = perceptual_model(frames, frames_recon).mean() * args.perceptual_weight
+                                z = vae.encode(x, quantize=False, include_embeddings=True)
+                                # normalize to -1 and 1 (apply scaling factor)
+                                latents = ((z - vae.codebook.embeddings.min()) /
+                                           (vae.codebook.embeddings.max() -
+                                            vae.codebook.embeddings.min())) * 2.0 - 1.0
                                 
-                                del x_recon, frames, frames_recon
+                                B = latents.shape[0]
+                                check_shape(latents, 'b c f h w', 
+                                            c=int(vae.config.embedding_dim), 
+                                            f=int(input_size[0] / vae.config.downsample[0]), # saggital
+                                            h=int(input_size[1] / vae.config.downsample[1]), # coronal
+                                            w=int(input_size[2] / vae.config.downsample[2])) # axial
+                                
+                                timesteps = torch.randint(0, args.num_timesteps, (B,), device=latents.device).long()
 
-                                # Gather the losses across all processes for logging (if we use distributed training).
-                                val_loss = val_recon_loss + val_perceptual_loss
-                                #print("### VAL loss:", val_loss, flush=True) ###
+                                noise = torch.randn_like(latents)
+                                if args.noise_offset:
+                                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                                    noise += args.noise_offset * torch.randn(
+                                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                                    )
+                                if args.input_perturbation:
+                                    noise += args.input_perturbation * torch.randn_like(noise)
+
+                                noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
+
+                                cond = None # TODO: implement label conditioning embedding
+                                if is_list_str(cond):
+                                    cond = bert_embed(tokenize(cond), return_cls_repr=False)
+                                    cond = cond.to(latents.device)
+
+                                z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond)
+
+                                if args.loss_type == 'l1':
+                                    val_loss = F.l1_loss(noise, z_pred)
+                                elif args.loss_type == 'l2':
+                                    val_loss = F.mse_loss(noise, z_pred)
+                                else:
+                                    raise NotImplementedError()
 
                                 if not torch.isfinite(val_loss):
                                     logger.info("\nWARNING: non-finite loss.")
@@ -1217,7 +1148,7 @@ def main():
                                 gathered_valid_loss = accelerator.gather(val_loss)
                                 valid_loss += gathered_valid_loss.sum()
                                 #valid_loss += val_loss.sum()
-
+                                
                                 # val_avg_loss = accelerator.gather(val_loss.repeat(args.valid_batch_size)).mean()
                                 # valid_loss += val_avg_loss.item() # / args.gradient_accumulation_steps
 
@@ -1228,13 +1159,14 @@ def main():
                             #     valid_loss = 0.0
 
                         logs = {
+                            #"valid_step_loss": val_loss.detach().item(),
                             "valid_loss": valid_loss.detach().item() / len(test_dataloader.dataset),
-                            "valid_recon_loss": val_recon_loss.detach().item(),
-                            "valid_perceptual_loss": val_perceptual_loss.detach().item(),
-                            "valid_perplexity": val_vq_output['perplexity'].detach().item(),
-                            "valid_commitment_loss": val_vq_output['commitment_loss'].detach().item(),
                         }
                         accelerator.log(logs)
+
+                    if args.use_ema:
+                    # Switch back to the original UNet parameters.
+                        ema_unet3d.restore(unet3d.parameters())
 
             progress_bar.set_postfix(**logs)
 
