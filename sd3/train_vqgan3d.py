@@ -213,6 +213,14 @@ def parse_args():
     #     help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     # )
     parser.add_argument(
+        "--axis",
+        type=str,
+        default=None,
+        help=(
+            "3D volume's axis that will be processed as the temporal axis."
+        ),
+    )
+    parser.add_argument(
         "--data_dir",
         type=str,
         default=None,
@@ -517,7 +525,7 @@ def parse_args():
 
 # Define custom dataset class
 class UKB_Dataset(Dataset):
-    def __init__(self, image_dir, label_dir, transform=None, device=None):
+    def __init__(self, image_dir, label_dir, transform=None, device=None, axis="s"):
         super(UKB_Dataset, self).__init__()
         self.data_dir = image_dir
         data_csv = pd.read_csv(label_dir)
@@ -528,6 +536,7 @@ class UKB_Dataset(Dataset):
         # print("labels: ", len(self.labels), self.labels[-1])
         self.transform = transform
         self.device = device
+        self.axis = axis
         del data_csv
 
     def __len__(self):
@@ -539,7 +548,14 @@ class UKB_Dataset(Dataset):
         # Load the image
         image = np.load(os.path.join(self.data_dir, 'final_array_128_full_' + str(image_name) + '.npy')).astype(np.float16) # (128,128,128,1)
         image = torch.from_numpy(image).type(torch.float16) ###
-        image = image.permute(3, 2, 0, 1) # (1,128,128,128)
+        if self.axis == "s":
+            image = image.permute(3, 0, 1, 2) # (1,128,128,128)
+        elif self.axis == "c":
+            image = image.permute(3, 1, 0, 2) # (1,128,128,128)
+        elif self.axis == "a":
+            image = image.permute(3, 2, 1, 0) # (1,128,128,128)
+        else:
+            raise ValueError("Need 'a' or 'c' or 's' as a temporal axis.")
         sample = dict()
         sample["pixel_values"] = image
         del image
@@ -769,8 +785,8 @@ def main():
 
     with accelerator.main_process_first():
         if args.data_dir is not None: # args.test_data_dir is not None and args.data_dir is not None:
-            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, device=accelerator.device)
-            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, device=accelerator.device)
+            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
+            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
