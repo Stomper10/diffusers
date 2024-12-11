@@ -610,7 +610,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
-        denoise_fn,
+        #denoise_fn, ###
         *,
         #image_size,
         #num_frames,
@@ -626,7 +626,7 @@ class GaussianDiffusion(nn.Module):
         #self.channels = channels
         #self.image_size = image_size
         #self.num_frames = num_frames
-        self.denoise_fn = denoise_fn
+        #self.denoise_fn = denoise_fn ###
 
         # if vqgan_ckpt:
         #     self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt).cuda()
@@ -715,9 +715,9 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+    def p_mean_variance(self, unet, x, t, clip_denoised: bool, cond=None, cond_scale=1.): ###
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
+            x, t=t, noise=unet.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)) ###
 
         if clip_denoised:
             s = 1.
@@ -739,10 +739,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, unet, x, t, cond=None, cond_scale=1., clip_denoised=True): ###
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
+            unet, x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale) ###
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -750,14 +750,14 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.):
+    def p_sample_loop(self, unet, shape, cond=None, cond_scale=1.): ###
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-            img = self.p_sample(img, torch.full(
+            img = self.p_sample(unet, img, torch.full( ###
                 (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
 
         return img
@@ -774,7 +774,7 @@ class GaussianDiffusion(nn.Module):
         # channels = self.channels
         # num_frames = self.num_frames
         _sample = self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale)
+            unet, (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale) ###
 
         if isinstance(vae, VQGAN):
             # denormalize TODO: Remove eventually
@@ -1152,3 +1152,510 @@ class Trainer(object):
             self.step += 1
 
         print('training completed')
+
+
+
+class SamePadConv3d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, bias=True, padding_type='replicate'):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,) * 3
+        if isinstance(stride, int):
+            stride = (stride,) * 3
+
+        # assumes that the input shape is divisible by stride
+        total_pad = tuple([k - s for k, s in zip(kernel_size, stride)])
+        pad_input = []
+        for p in total_pad[::-1]:  # reverse since F.pad starts from last dim
+            pad_input.append((p // 2 + p % 2, p // 2))
+        pad_input = sum(pad_input, tuple())
+        self.pad_input = pad_input
+        self.padding_type = padding_type
+
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size,
+                              stride=stride, padding=0, bias=bias)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, self.pad_input, mode=self.padding_type))
+
+
+
+class PatchUnet3D(ModelMixin, ConfigMixin):
+
+    @register_to_config
+    def __init__(
+        self,
+        dim: int = 32,
+        cond_dim=None,
+        out_dim=None,
+        dim_mults: Tuple[int, ...] = (1, 2, 4, 8),
+        channels: int = 3,
+        attn_heads: int = 8,
+        attn_dim_head: int = 32,
+        use_bert_text_cond=False,
+        init_dim=None,
+        init_kernel_size: int = 7,
+        use_sparse_linear_attn=True,
+        block_type: str = 'resnet',
+        resnet_groups: int = 8,
+        num_patch_positions: int = 27, ###
+        guide_mode: str = 'emb', ### 'concat' or 'emb'
+        patch_position_embedding_dim: int = 16, ###
+        low_res_guidance_channel: int = 0, ###
+        guidance_dim: int = 64,  ### Example value
+        guidance_embedding_dim: int = 0, ### 128
+    ):
+        super().__init__()
+
+        # temporal attention and its relative positional encoding
+
+        rotary_emb = RotaryEmbedding(min(32, attn_dim_head))
+
+        def temporal_attn(dim): return EinopsToAndFrom('b c f h w', 'b (h w) f c', Attention(
+            dim, heads=attn_heads, dim_head=attn_dim_head, rotary_emb=copy.deepcopy(rotary_emb))) ###
+
+        # realistically will not be able to generate that many frames of video... yet
+        self.time_rel_pos_bias = RelativePositionBias(
+            heads=attn_heads, max_distance=32)
+
+        # initial conv
+
+        init_dim = default(init_dim, dim)
+        assert is_odd(init_kernel_size)
+
+        init_padding = init_kernel_size // 2
+
+        self.guide_mode = guide_mode
+        if self.guide_mode == 'concat':
+            channels += low_res_guidance_channel
+
+        self.init_conv = nn.Conv3d(channels, init_dim, (1, init_kernel_size, ###
+                                   init_kernel_size), padding=(0, init_padding, init_padding))
+
+        self.init_temporal_attn = Residual(
+            PreNorm(init_dim, temporal_attn(init_dim)))
+
+        # dimensions
+
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        # Embedding layer for patch positions
+        self.patch_position_embedding = nn.Embedding(
+            num_embeddings=num_patch_positions,
+            embedding_dim=patch_position_embedding_dim
+        )
+
+        # time conditioning
+
+        time_dim = dim * 4
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(dim),
+            nn.Linear(dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        # text conditioning
+
+        self.has_cond = exists(cond_dim) or use_bert_text_cond
+        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
+
+        self.null_cond_emb = nn.Parameter(
+            torch.randn(1, cond_dim)) if self.has_cond else None
+
+        cond_dim = time_dim + int(cond_dim or 0) + patch_position_embedding_dim + guidance_embedding_dim
+
+        # layers
+
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+
+        num_resolutions = len(in_out)
+
+        # block type
+
+        block_klass = partial(ResnetBlock, groups=resnet_groups)
+        block_klass_cond = partial(block_klass, time_emb_dim=cond_dim)
+
+        # modules for all layers
+
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                block_klass_cond(dim_in, dim_out),
+                block_klass_cond(dim_out, dim_out),
+                Residual(PreNorm(dim_out, SpatialLinearAttention(
+                    dim_out, heads=attn_heads))) if use_sparse_linear_attn else nn.Identity(),
+                Residual(PreNorm(dim_out, temporal_attn(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        mid_dim = dims[-1]
+        self.mid_block1 = block_klass_cond(mid_dim, mid_dim)
+
+        spatial_attn = EinopsToAndFrom(
+            'b c f h w', 'b f (h w) c', Attention(mid_dim, heads=attn_heads))
+
+        self.mid_spatial_attn = Residual(PreNorm(mid_dim, spatial_attn))
+        self.mid_temporal_attn = Residual(
+            PreNorm(mid_dim, temporal_attn(mid_dim)))
+
+        self.mid_block2 = block_klass_cond(mid_dim, mid_dim)
+
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.ups.append(nn.ModuleList([
+                block_klass_cond(dim_out * 2, dim_in),
+                block_klass_cond(dim_in, dim_in),
+                Residual(PreNorm(dim_in, SpatialLinearAttention(
+                    dim_in, heads=attn_heads))) if use_sparse_linear_attn else nn.Identity(),
+                Residual(PreNorm(dim_in, temporal_attn(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+        out_dim = default(out_dim, channels)
+
+        if self.guide_mode == 'concat':
+            out_dim -= low_res_guidance_channel
+
+        self.final_conv = nn.Sequential(
+            block_klass(dim * 2, dim),
+            nn.Conv3d(dim, out_dim, 1)
+        )
+
+        if self.guide_mode == 'emb':
+            self.low_res_encoder = nn.Sequential(
+                SamePadConv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding_type="replicate"),
+                #nn.Conv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool3d(1),  # Global pooling to get a feature vector
+                nn.Flatten(),
+                nn.Linear(guidance_dim, guidance_embedding_dim),
+                nn.ReLU()
+            )
+
+        # After setting guide_mode and building low_res_encoder, define film_mlp:
+        if guidance_embedding_dim > 0:
+            self.film_mlp = nn.Sequential(
+                nn.Linear(guidance_embedding_dim, 2 * mid_dim)
+                # Optionally add an activation if needed:
+                # nn.Linear(guidance_embedding_dim, 2 * mid_dim),
+                # nn.ReLU(), # If you prefer a nonlinear transformation
+            )
+        else:
+            self.film_mlp = None
+
+    def forward_with_cond_scale(
+        self,
+        *args,
+        cond_scale=2.,
+        **kwargs
+    ):
+        logits = self.forward(*args, null_cond_prob=0., **kwargs)
+        if cond_scale == 1 or not self.has_cond:
+            return logits
+
+        null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
+        return null_logits + (logits - null_logits) * cond_scale
+
+    def forward(
+        self,
+        x,
+        time,
+        patch_position, ###
+        low_res_guidance=None, ###
+        cond=None,
+        null_cond_prob=0.,
+        focus_present_mask=None,
+        # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
+        prob_focus_present=0.
+    ):
+        assert not (self.has_cond and not exists(cond)
+                    ), 'cond must be passed in if cond_dim specified'
+        batch, device = x.shape[0], x.device
+
+        focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
+            (batch,), prob_focus_present, device=device))
+
+        time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
+
+        guidance_emb = None
+        if self.guide_mode == 'emb':
+            guidance_emb = self.low_res_encoder(low_res_guidance)
+        elif self.guide_mode == 'concat' and low_res_guidance is not None:
+            x = torch.cat([x, low_res_guidance], dim=1)
+
+        x = self.init_conv(x)
+        r = x.clone()
+
+        x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
+
+        t = self.time_mlp(time) if exists(self.time_mlp) else None
+        patch_pos_emb = self.patch_position_embedding(patch_position)
+        # print("### t.shape:", t.shape)
+        # print("### patch_pos_emb.shape:", patch_pos_emb.shape)
+        # print("### cond.shape:", cond.shape)
+        # print("### guidance_emb.shape:", guidance_emb.shape)
+
+        cond_emb_list = [t, patch_pos_emb]
+        # classifier free guidance
+
+        if self.has_cond:
+            batch, device = x.shape[0], x.device
+            mask = prob_mask_like((batch,), null_cond_prob, device=device)
+            cond = torch.where(rearrange(mask, 'b -> b 1'),
+                               self.null_cond_emb, cond)
+            cond_emb_list.append(cond)
+            #t = torch.cat((t, patch_pos_emb, cond, guidance_emb), dim=-1)
+            #t = torch.cat((t, cond), dim=-1)
+        
+        # Concatenate all conditioning embeddings
+        t = torch.cat([emb for emb in cond_emb_list if emb is not None], dim=-1)
+
+        h = []
+
+        for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
+            x = block1(x, t)
+            x = block2(x, t)
+            x = spatial_attn(x)
+            x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+                              focus_present_mask=focus_present_mask)
+            h.append(x)
+            x = downsample(x)
+
+        if guidance_emb is not None:
+            scale_shift_params = self.film_mlp(guidance_emb) # MLP on guidance_emb
+            scale, shift = scale_shift_params.chunk(2, dim=-1)
+            # reshape scale, shift to match x's spatial dimensions
+            scale = scale[:, :, None, None, None]
+            shift = shift[:, :, None, None, None]
+            x = x * (scale + 1) + shift
+
+        x = self.mid_block1(x, t)
+        x = self.mid_spatial_attn(x)
+        x = self.mid_temporal_attn(
+            x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
+        x = self.mid_block2(x, t)
+
+        for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
+            x = torch.cat((x, h.pop()), dim=1)
+            x = block1(x, t)
+            x = block2(x, t)
+            x = spatial_attn(x)
+            x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+                              focus_present_mask=focus_present_mask)
+            x = upsample(x)
+
+        x = torch.cat((x, r), dim=1)
+        return self.final_conv(x)
+
+
+
+class PatchGaussianDiffusion(nn.Module):
+    def __init__(
+        self,
+        #denoise_fn, ###
+        *,
+        #image_size,
+        #num_frames,
+        #text_use_bert_cls=False,
+        #channels=3,
+        timesteps=1000,
+        #loss_type='l1',
+        use_dynamic_thres=False,  # from the Imagen paper
+        dynamic_thres_percentile=0.9,
+        #vqgan_ckpt=None,
+    ):
+        super().__init__()
+        #self.channels = channels
+        #self.image_size = image_size
+        #self.num_frames = num_frames
+        #self.denoise_fn = denoise_fn ###
+
+        # if vqgan_ckpt:
+        #     self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt).cuda()
+        #     self.vqgan.eval()
+        # else:
+        #     self.vqgan = None
+
+        betas = cosine_beta_schedule(timesteps)
+
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        #self.loss_type = loss_type
+
+        # register buffer helper function that casts float64 to float32
+
+        def register_buffer(name, val): return self.register_buffer(
+            name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod',
+                        torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod',
+                        torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod',
+                        torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod',
+                        torch.sqrt(1. / alphas_cumprod - 1))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
+        posterior_variance = betas * \
+            (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
+        register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
+        register_buffer('posterior_log_variance_clipped',
+                        torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_mean_coef1', betas *
+                        torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev)
+                        * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        # text conditioning parameters
+
+        #self.text_use_bert_cls = text_use_bert_cls
+
+        # dynamic thresholding when sampling
+
+        self.use_dynamic_thres = use_dynamic_thres
+        self.dynamic_thres_percentile = dynamic_thres_percentile
+
+    def q_mean_variance(self, x_start, t):
+        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract(
+            self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        return mean, variance, log_variance
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(
+            self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, unet, x, t, clip_denoised: bool, patch_position, low_res_guidance=None, cond=None, cond_scale=1.): ###
+        x_recon = self.predict_start_from_noise(
+            x, t=t, noise=unet.forward_with_cond_scale(x, t, patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale)) ###
+
+        if clip_denoised:
+            s = 1.
+            if self.use_dynamic_thres:
+                s = torch.quantile(
+                    rearrange(x_recon, 'b ... -> b (...)').abs(),
+                    self.dynamic_thres_percentile,
+                    dim=-1
+                )
+
+                s.clamp_(min=1.)
+                s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+
+            # clip by threshold, depending on whether static or dynamic
+            x_recon = x_recon.clamp(-s, s) / s
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+            x_start=x_recon, x_t=x, t=t)
+        return model_mean, posterior_variance, posterior_log_variance
+
+    @torch.inference_mode()
+    def p_sample(self, unet, x, t, patch_position, low_res_guidance=None, cond=None, cond_scale=1., clip_denoised=True): ###
+        b, *_, device = *x.shape, x.device
+        model_mean, _, model_log_variance = self.p_mean_variance(
+            unet, x=x, t=t, clip_denoised=clip_denoised, patch_position=patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale) ###
+        noise = torch.randn_like(x)
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(b,
+                                                      *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.inference_mode()
+    def p_sample_loop(self, unet, shape, patch_position, low_res_guidance=None, cond=None, cond_scale=1.): ###
+        device = self.betas.device
+
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            img = self.p_sample(unet, img, torch.full( ###
+                (b,), i, device=device, dtype=torch.long), patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale)
+
+        return img
+
+    @torch.inference_mode()
+    def sample(self, vae, unet, image_size, num_frames, channels, patch_position, low_res_guidance=None, cond=None, cond_scale=1., batch_size=16): ###
+        device = next(unet.parameters()).device
+
+        if is_list_str(cond):
+            cond = bert_embed(tokenize(cond)).to(device)
+
+        #batch_size = cond.shape[0] if exists(cond) else batch_size
+        # image_size = self.image_size
+        # channels = self.channels
+        # num_frames = self.num_frames
+        _sample = self.p_sample_loop(
+            unet, (batch_size, channels, num_frames, image_size, image_size), patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale) ###
+
+        if isinstance(vae, VQGAN):
+            # denormalize TODO: Remove eventually
+            _sample = (((_sample + 1.0) / 2.0) * (vae.codebook.embeddings.max() -
+                                                  vae.codebook.embeddings.min())) + vae.codebook.embeddings.min()
+
+            _sample = vae.decode(_sample, quantize=True)
+        else:
+            unnormalize_img(_sample)
+
+        return _sample
+
+    @torch.inference_mode()
+    def interpolate(self, x1, x2, t=None, lam=0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
+            img = self.p_sample(img, torch.full(
+                (b,), i, device=device, dtype=torch.long))
+
+        return img
+
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod,
+                    t, x_start.shape) * noise
+        )

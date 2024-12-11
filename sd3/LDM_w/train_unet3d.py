@@ -16,6 +16,7 @@
 
 """
 TODO: Diffusers scheduler? SD3? (flow matching)
+TODO: increase cond_dim if add conditions
 """
 
 import os
@@ -100,23 +101,37 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, num_samples):
+def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, gloabal_step, num_samples, save_dir):
     logger.info("Running validation... ")
+    vae.eval()
+    unet3d.eval()
     vae = accelerator.unwrap_model(vae)
     unet3d = accelerator.unwrap_model(unet3d)
+
+    os.makedirs(os.path.join(save_dir, "generated_volumes"), exist_ok=True)
 
     images = []
     with torch.autocast(accelerator.device.type, dtype=weight_dtype):
         for i in range(num_samples):
+            
+            age = torch.tensor([0.5], dtype=torch.float16).to(unet3d.device)
+
             image = noise_scheduler.sample(vae=vae,
                                         unet=unet3d,
-                                        image_size=int(input_size[0] / vae.config.downsample[0]),
-                                        num_frames=int(input_size[1] / vae.config.downsample[1]),
+                                        image_size=int(input_size[1] / vae.config.downsample[1]),
+                                        num_frames=int(input_size[0] / vae.config.downsample[0]),
                                         channels=int(vae.config.embedding_dim),
-                                        cond=None,
+                                        cond=age, #####
                                         batch_size=1
                                         )
             images.append(image)
+            image_np = image.squeeze().cpu().numpy()  # Shape: (D, H, W)
+
+            # Save as .npy file
+            npy_path = os.path.join(os.path.join(save_dir, "generated_volumes"), f"generated_volume_checkpoint_{gloabal_step}_{i}.npy")
+            np.save(npy_path, image_np)
+            logger.info(f"Saved generated image to {npy_path}")
+
         x = next(iter(test_dataloader))["pixel_values"][:num_samples]
     
     images = torch.stack([x.cpu(), torch.cat(images, dim=0).cpu()], dim=1)
@@ -125,7 +140,7 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
         tracker.name = "wandb"
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, epoch)
+            tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, gloabal_step)
         elif tracker.name == "wandb":
             # tracker.log(
             #     {
@@ -166,7 +181,7 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
     del images
     torch.cuda.empty_cache()
 
-def count_activations(model, dummy_input, time):
+def count_activations(model, dummy_input, time, cond):
     activations = []
     def hook_fn(module, input, output):
         # Add the number of elements in the output to the activations list
@@ -183,7 +198,7 @@ def count_activations(model, dummy_input, time):
     
     # Forward pass through the model
     with torch.no_grad():
-        model(dummy_input, time=time)
+        model(dummy_input, time=time, cond=cond)
     
     # Remove all the hooks
     for hook in hooks:
@@ -266,6 +281,22 @@ def parse_args():
         default=None,
         help=(
             "3D volume's axis that will be processed as the temporal axis."
+        ),
+    )
+    parser.add_argument(
+        "--dim_mults",
+        type=str,
+        default=None,
+        help=(
+            "dim_mults for Unet3D."
+        ),
+    )
+    parser.add_argument(
+        "--attn_heads",
+        type=int,
+        default=None,
+        help=(
+            "attn_heads for Unet3D."
         ),
     )
     parser.add_argument(
@@ -596,7 +627,29 @@ class UKB_Dataset(Dataset):
         self.data_dir = image_dir
         data_csv = pd.read_csv(label_dir)
         self.image_names = list(data_csv['id'])
-        self.ages = list(data_csv['age'])
+
+        # load conditioning variable: age
+        self.ages = data_csv['age'].values.astype(np.float16)
+        self.min_age, self.max_age = self.ages.min(), self.ages.max()
+        self.norm_ages = (self.ages - self.min_age) / (self.max_age - self.min_age)
+        
+        # # load conditioning variable: ventricular volume
+        # self.bvvs = data_csv['ventricular_volume'].values.astype(np.float32)
+        # self.min_bvv, self.max_bvv = self.bvvs.min(), self.bvvs.max()
+        # self.norm_bvvs = (self.bvvs - self.min_bvv) / (self.max_bvv - self.min_bvv)
+
+        # # load conditioning variable: gender
+        # self.genders = data_csv['gender'].values
+        # self.gender_encoded = []
+        # for gender_str in self.genders:
+        #     if gender_str == 'Male':
+        #         self.gender_encoded.append([1.0, 0.0])
+        #     elif gender_str == 'Female':
+        #         self.gender_encoded.append([0.0, 1.0])
+        #     else:
+        #         self.gender_encoded.append([0.0, 0.0])  # Handle unknown gender
+        # self.gender_encoded = np.array(self.gender_encoded, dtype=np.float16)
+        
         self.transform = transform
         self.axis = axis
         self.image_paths = [
@@ -609,10 +662,9 @@ class UKB_Dataset(Dataset):
 
     def __getitem__(self, index):
         image_path = self.image_paths[index]
-        age = self.ages[index]
         
         try:
-            image = np.load(image_path).astype(np.float16)  # (128,128,128,1)
+            image = np.load(image_path)  # (128,128,128,1)
         except FileNotFoundError:
             raise FileNotFoundError(f"Image file not found: {image_path}")
         
@@ -628,10 +680,33 @@ class UKB_Dataset(Dataset):
             image = image.permute(*axes_mapping[self.axis])  # (1,128,128,128)
         except KeyError:
             raise ValueError("axis must be one of 'a', 'c', or 's'.")
+        
+        # Add batch dimension (N=1) for interpolation
+        image = image.unsqueeze(0)  # Shape: (1, 1, D, H, W)
+
+        # Define target size
+        target_size = (218, 182, 182)  # (D₂, H₂, W₂)
+
+        # Resize the volume using trilinear interpolation
+        image = F.interpolate(
+            image,
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
+
+        # Remove the batch dimension
+        image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,182,218,182)
+        
+        age = torch.tensor([self.norm_ages[index]], dtype=torch.float16) # Shape: [1]
+        # gender = torch.tensor(self.gender_encoded[index], dtype=torch.float16)  # Shape: [2]
+        # bvv = torch.tensor([self.normalized_bvvs[index]], dtype=torch.float16)  # Shape: [1]
+
+        #cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
 
         sample = {
             "pixel_values": image,
-            "age": age
+            "condition": age #cond_tensor
         }
 
         if self.transform:
@@ -714,18 +789,25 @@ def main():
     ).to(accelerator.device)
     vae.requires_grad_(False)
 
+    dim_mults = tuple(int(x) for x in args.dim_mults.split(","))
     unet3d = Unet3D(
-        dim=int(input_size[0] / vae.config.downsample[0]), # 32
-        dim_mults=(1,2,4,8),
-        channels=int(vae.config.embedding_dim) # 8
+        dim=int(input_size[1] / vae.config.downsample[1]), # 32
+        cond_dim=1, # age
+        dim_mults=dim_mults, #(1,2,4,8,16),
+        channels=int(vae.config.embedding_dim), # 8
+        attn_heads=args.attn_heads, # 16
+        attn_dim_head=int(args.attn_heads*2),
     ).to(accelerator.device)
 
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet3d = Unet3D(
-            dim=int(input_size[0] / vae.config.downsample[0]),
-            dim_mults=(1,2,4,8),
-            channels=int(vae.config.embedding_dim)
+            dim=int(input_size[1] / vae.config.downsample[1]),
+            cond_dim=1, # age
+            dim_mults=dim_mults, #(1,2,4,8,16),
+            channels=int(vae.config.embedding_dim),
+            attn_heads=args.attn_heads,
+            attn_dim_head=int(args.attn_heads*2),
         )
         ema_unet3d = EMAModel(
             ema_unet3d.parameters(), 
@@ -736,7 +818,7 @@ def main():
         )
 
     noise_scheduler = GaussianDiffusion( # diffusers pipeline?
-        unet3d,
+        #unet3d,
         #vqgan_ckpt=cfg.model.vqgan_ckpt,
         #image_size=cfg.model.diffusion_img_size,
         #num_frames=cfg.model.diffusion_depth_size,
@@ -848,8 +930,8 @@ def main():
     train_transforms = transforms.Compose(
         [
             transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
-            #transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
-            transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
+            transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
+            #transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
@@ -858,8 +940,8 @@ def main():
 
     with accelerator.main_process_first():
         if args.data_dir is not None: # args.test_data_dir is not None and args.data_dir is not None:
-            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
-            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
+            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, axis=args.axis)
+            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, axis=args.axis)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1016,11 +1098,12 @@ def main():
     progress_bar.set_description("Steps")
 
     # Model memory check
-    dummy_input = torch.ones(1, 8, 32, 32, 32).float().to(accelerator.device) # 262,144 for 64^3
+    dummy_input = torch.ones(1, 8, 38, 32, 32).float().to(accelerator.device) # 262,144 for 64^3
     timesteps = torch.randint(0, args.num_timesteps, (dummy_input.shape[0],)).long().to(accelerator.device)
+    cond = torch.tensor([0.5]).float().to(accelerator.device)
     unet3d.eval()
 
-    unet3d_activations = count_activations(unet3d, dummy_input, timesteps)
+    unet3d_activations = count_activations(unet3d, dummy_input, timesteps, cond)
     print(f"### UNET3D's number of activations: {unet3d_activations:,}")
     
     # Show model architecture and # of params
@@ -1054,10 +1137,7 @@ def main():
                                    (vae.codebook.embeddings.max() -
                                     vae.codebook.embeddings.min())) * 2.0 - 1.0
                     
-                    # directly condition the continuous values
-                    latents = torch.cat([latents, batch["normalized_age"].unsqueeze(-1).expand(-1, latents.shape[1])], dim=1)
-
-                    # print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
+                    print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
                     B = latents.shape[0]
                     check_shape(latents, 'b c f h w', 
                                 c=int(vae.config.embedding_dim), 
@@ -1078,13 +1158,12 @@ def main():
 
                     noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
 
-                    cond = None # TODO: implement label conditioning embedding
-                    cond = batch["age"] #####
+                    cond = batch["condition"].to(latents.device)
                     if is_list_str(cond):
                         cond = bert_embed(tokenize(cond), return_cls_repr=False)
                         cond = cond.to(latents.device)
 
-                    z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond)
+                    z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond, null_cond_prob=0.1)
 
                     if args.loss_type == 'l1':
                         loss = F.l1_loss(noise, z_pred)
@@ -1175,7 +1254,7 @@ def main():
                     # validation
                     if accelerator.is_main_process:
                         print("### Start validation ###")
-                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, args.num_samples)
+                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, global_step, args.num_samples, save_path)
                     
                     with torch.no_grad():
                         vae.eval()
@@ -1211,7 +1290,7 @@ def main():
 
                                 noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
 
-                                cond = None # TODO: implement label conditioning embedding
+                                cond = batch["condition"].to(latents.device)
                                 if is_list_str(cond):
                                     cond = bert_embed(tokenize(cond), return_cls_repr=False)
                                     cond = cond.to(latents.device)

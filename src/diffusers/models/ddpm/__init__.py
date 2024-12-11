@@ -1,1 +1,1 @@
-from .diffusion import Unet3D, GaussianDiffusion, Trainer
+from .diffusion import Unet3D, GaussianDiffusion, Trainer, PatchUnet3D, PatchGaussianDiffusion

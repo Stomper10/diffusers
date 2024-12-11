@@ -181,9 +181,14 @@ wandb
 sd3/script/*
 sd3/results/*
 sd3/temp/*
+sd3/LDM_w/outputs/*
+sd3/LDM_w/results/*
+sd3/LDM_p/outputs/*
+sd3/LDM_p/results/*
 src/diffusers/models/vq_gan_3d/cache/*
 labs
 sd3/3d_visualize*
 sd3/test.py
-PEDMASTER_ALL_20180514.txt
+sd3/data/raw/*
+
 

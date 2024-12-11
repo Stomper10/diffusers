@@ -16,12 +16,14 @@
 
 """
 TODO: Diffusers scheduler? SD3? (flow matching)
+TODO: increase cond_dim if add conditions
 """
 
 import os
 import time
 import math
 import shutil
+import random
 import logging
 import argparse
 import datasets
@@ -68,7 +70,7 @@ from diffusers.training_utils import EMAModel #,compute_snr
 #from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 
 from diffusers.models.vq_gan_3d import VQGAN #, LPIPS, NLayerDiscriminator, NLayerDiscriminator3D
-from diffusers.models.ddpm import Unet3D, GaussianDiffusion
+from diffusers.models.ddpm import PatchUnet3D, PatchGaussianDiffusion
 from diffusers.models.ddpm.diffusion import default, is_list_str
 from diffusers.models.ddpm.text import tokenize, bert_embed #, BERT_MODEL_DIM
 #from diffusers.models.vq_gan_3d.utils import adopt_weight
@@ -100,24 +102,101 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, num_samples):
+def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, gloabal_step, num_samples, save_dir):
     logger.info("Running validation... ")
+    vae.eval()
+    unet3d.eval()
     vae = accelerator.unwrap_model(vae)
     unet3d = accelerator.unwrap_model(unet3d)
 
+    os.makedirs(os.path.join(save_dir, "generated_volumes"), exist_ok=True)
+
     images = []
     with torch.autocast(accelerator.device.type, dtype=weight_dtype):
+        batch = next(iter(test_dataloader))
+        x = batch["pixel_values"][:num_samples]
+        cond = batch["condition"][:num_samples]
+        patch_position = batch["patch_position"][:num_samples]
+        low_res_guidance = batch["lowres_guide"][:num_samples]
+        
         for i in range(num_samples):
+            
+            # patch_index = 13
+            # cond = torch.tensor([0.5], dtype=torch.float16).to(unet3d.device)
+            # patch_position = torch.tensor(patch_index, dtype=torch.long).unsqueeze(0).to(unet3d.device)
+            # lowres_guide = torch.load("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/low-res_gen/tensor_low-res_image_origin.pth").to(torch.float64).to(unet3d.device)
+
+            # lowres_guide = F.interpolate(
+            #     lowres_guide,
+            #     size=(218, 182, 182),
+            #     mode='trilinear',
+            #     align_corners=False
+            # )
+            # lowres_guide = lowres_guide.squeeze(0).to(torch.float16)
+
+            # # Initialize lists
+            # depth_starts = [0, 71, 142]
+            # height_starts = [0, 59, 118]
+            # width_starts = [0, 59, 118]
+
+            # # Initialize index
+            # index = 0
+            # # Mapping list to store results
+            # mapping = []
+
+            # for id, start_d in enumerate(depth_starts):
+            #     for ih, start_h in enumerate(height_starts):
+            #         for iw, start_w in enumerate(width_starts):
+            #             mapping.append({
+            #                 'index': index,
+            #                 'start_d': start_d,
+            #                 'start_h': start_h,
+            #                 'start_w': start_w
+            #             })
+            #             print(f"Index: {index}, Start Coordinates: (D: {start_d}, H: {start_h}, W: {start_w})")
+            #             index += 1
+
+            # mapping_entry = mapping[patch_index] ###
+            # start_d = mapping_entry['start_d']
+            # start_h = mapping_entry['start_h']
+            # start_w = mapping_entry['start_w']
+            
+            # # Patch dimensions
+            # pd, ph, pw = 76, 64, 64
+            
+            # # Extract the patch
+            # patch = lowres_guide[
+            #     :, 
+            #     start_d:start_d + pd,
+            #     start_h:start_h + ph,
+            #     start_w:start_w + pw
+            # ]
+
+            # low_res_guidance = F.interpolate(
+            #     patch.unsqueeze(0).to(torch.float64),
+            #     size=(38, 32, 32),
+            #     mode='trilinear',
+            #     align_corners=False
+            # ).to(torch.float16)
+            
             image = noise_scheduler.sample(vae=vae,
                                         unet=unet3d,
-                                        image_size=int(input_size[0] / vae.config.downsample[0]),
-                                        num_frames=int(input_size[1] / vae.config.downsample[1]),
+                                        image_size=int(input_size[1] / vae.config.downsample[1]),
+                                        num_frames=int(input_size[0] / vae.config.downsample[0]),
                                         channels=int(vae.config.embedding_dim),
-                                        cond=None,
+                                        patch_position=patch_position[i].unsqueeze(0), ###
+                                        low_res_guidance=low_res_guidance[i].unsqueeze(0), ###
+                                        cond=cond[i].unsqueeze(0), ###
+                                        cond_scale=1., ###
                                         batch_size=1
                                         )
             images.append(image)
-        x = next(iter(test_dataloader))["pixel_values"][:num_samples]
+            image_np = image.squeeze().cpu().numpy()  # Shape: (D, H, W)
+
+            # Save as .npy file
+            npy_path = os.path.join(os.path.join(save_dir, "generated_volumes"), f"generated_volume_checkpoint_{gloabal_step}_{i}.npy")
+            np.save(npy_path, image_np)
+            logger.info(f"Saved generated image to {npy_path}")
     
     images = torch.stack([x.cpu(), torch.cat(images, dim=0).cpu()], dim=1)
 
@@ -125,7 +204,7 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
         tracker.name = "wandb"
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, epoch)
+            tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, gloabal_step)
         elif tracker.name == "wandb":
             # tracker.log(
             #     {
@@ -142,7 +221,7 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
             #             for i, image in enumerate(images)
             #         ]
             #     }
-            # )
+            # )=
             tracker.log(
                 {
                     "Original (left), Generation (right) - Sagittal": [
@@ -166,7 +245,7 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
     del images
     torch.cuda.empty_cache()
 
-def count_activations(model, dummy_input, time):
+def count_activations(model, dummy_input, time, patch_position, cond, low_res_input):
     activations = []
     def hook_fn(module, input, output):
         # Add the number of elements in the output to the activations list
@@ -183,7 +262,7 @@ def count_activations(model, dummy_input, time):
     
     # Forward pass through the model
     with torch.no_grad():
-        model(dummy_input, time=time)
+        model(dummy_input, time=time, patch_position=patch_position, low_res_guidance=low_res_input, cond=cond)
     
     # Remove all the hooks
     for hook in hooks:
@@ -591,12 +670,35 @@ class UKB_Dataset(Dataset):
         transform (callable, optional): Optional transform to apply to samples.
         axis (str): Axis to permute ('a', 'c', or 's').
     """
-    def __init__(self, image_dir, label_dir, transform=None, axis="s"):
+    def __init__(self, image_dir, label_dir, transform=None, axis="s", patch_position=0):
         super().__init__()
         self.data_dir = image_dir
         data_csv = pd.read_csv(label_dir)
         self.image_names = list(data_csv['id'])
-        self.ages = list(data_csv['age'])
+
+        # load conditioning variable: age
+        self.ages = data_csv['age'].values.astype(np.float16)
+        self.min_age, self.max_age = self.ages.min(), self.ages.max()
+        self.norm_ages = (self.ages - self.min_age) / (self.max_age - self.min_age)
+
+        # # load conditioning variable: ventricular volume
+        # self.bvvs = data_csv['ventricular_volume'].values.astype(np.float32)
+        # self.min_bvv, self.max_bvv = self.bvvs.min(), self.bvvs.max()
+        # self.norm_bvvs = (self.bvvs - self.min_bvv) / (self.max_bvv - self.min_bvv)
+
+        # # load conditioning variable: gender
+        # self.genders = data_csv['gender'].values
+        # self.gender_encoded = []
+        # for gender_str in self.genders:
+        #     if gender_str == 'Male':
+        #         self.gender_encoded.append([1.0, 0.0])
+        #     elif gender_str == 'Female':
+        #         self.gender_encoded.append([0.0, 1.0])
+        #     else:
+        #         self.gender_encoded.append([0.0, 0.0])  # Handle unknown gender
+        # self.gender_encoded = np.array(self.gender_encoded, dtype=np.float16)
+
+        self.patch_position = patch_position
         self.transform = transform
         self.axis = axis
         self.image_paths = [
@@ -604,20 +706,64 @@ class UKB_Dataset(Dataset):
             for name in self.image_names
         ]
 
+        # Initialize lists
+        depth_starts = [0, 71, 142]
+        height_starts = [0, 59, 118]
+        width_starts = [0, 59, 118]
+
+        # Initialize index
+        index = 0
+        # Mapping list to store results
+        self.mapping = []
+
+        for id, start_d in enumerate(depth_starts):
+            for ih, start_h in enumerate(height_starts):
+                for iw, start_w in enumerate(width_starts):
+                    self.mapping.append({
+                        'index': index,
+                        'start_d': start_d,
+                        'start_h': start_h,
+                        'start_w': start_w
+                    })
+                    print(f"Index: {index}, Start Coordinates: (D: {start_d}, H: {start_h}, W: {start_w})")
+                    index += 1
+
+        # low-res guidance
+        #self.lowres_guidance = torch.load("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/low-res_gen/tensor_low-res_image_origin.pth").to(torch.float64)
+
+    def get_patch_by_index(self, volume, index, mapping):
+        # Retrieve the start coordinates from the mapping
+        mapping_entry = mapping[index]
+        start_d = mapping_entry['start_d']
+        start_h = mapping_entry['start_h']
+        start_w = mapping_entry['start_w']
+        
+        # Patch dimensions
+        pd, ph, pw = 76, 64, 64
+        
+        # Extract the patch
+        patch = volume[
+            :, 
+            start_d:start_d + pd,
+            start_h:start_h + ph,
+            start_w:start_w + pw
+        ]
+        return patch
+
     def __len__(self):
         return len(self.image_names)
 
     def __getitem__(self, index):
         image_path = self.image_paths[index]
-        age = self.ages[index]
-        
+        #lowres_guide = self.lowres_guidance
+
         try:
-            image = np.load(image_path).astype(np.float16)  # (128,128,128,1)
+            image = np.load(image_path)  # (128,128,128,1)
         except FileNotFoundError:
             raise FileNotFoundError(f"Image file not found: {image_path}")
         
         image = torch.from_numpy(image)  # Stays on CPU
-
+        
         axes_mapping = {
             's': (3, 0, 1, 2),
             'c': (3, 1, 0, 2),
@@ -628,15 +774,64 @@ class UKB_Dataset(Dataset):
             image = image.permute(*axes_mapping[self.axis])  # (1,128,128,128)
         except KeyError:
             raise ValueError("axis must be one of 'a', 'c', or 's'.")
+        
+        # Add batch dimension (N=1) for interpolation
+        image = image.unsqueeze(0)  # Shape: (1, 1, D, H, W)
+
+        # Define target size
+        target_size = (218, 182, 182)  # (D₂, H₂, W₂)
+        lowres_size = (76, 64, 64)
+
+        # Resize the volume using trilinear interpolation
+        image = F.interpolate(
+            image,
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
+        lowres_guide = F.interpolate(
+            image,
+            size=lowres_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
+        lowres_guide = F.interpolate(
+            lowres_guide,
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
+
+        # Remove the batch dimension
+        image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
+        lowres_guide = lowres_guide.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
+
+        age = torch.tensor([self.norm_ages[index]], dtype=torch.float16) # Shape: [1]
+        # gender = torch.tensor(self.gender_encoded[index], dtype=torch.float16)  # Shape: [2]
+        # bvv = torch.tensor([self.normalized_bvvs[index]], dtype=torch.float16)  # Shape: [1]
+
+        #cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
 
         sample = {
             "pixel_values": image,
-            "age": age
+            "condition": age,
+            #"lowres_guide": lowres_guide,
         }
 
         if self.transform:
             sample = self.transform(sample)
         del image
+
+        patch_position_sampled = random.randint(0, 26)
+        sample["pixel_values"] = self.get_patch_by_index(sample["pixel_values"], patch_position_sampled, self.mapping)
+        sample["lowres_guide"] = self.get_patch_by_index(lowres_guide, patch_position_sampled, self.mapping)
+        sample["lowres_guide"] = F.interpolate(
+            sample["lowres_guide"].unsqueeze(0).to(torch.float64),
+            size=(38, 32, 32),
+            mode='trilinear',
+            align_corners=False
+        ).squeeze(0).to(torch.float16)
+        sample["patch_position"] = torch.tensor(patch_position_sampled, dtype=torch.long)
 
         return sample
 
@@ -714,29 +909,35 @@ def main():
     ).to(accelerator.device)
     vae.requires_grad_(False)
 
-    unet3d = Unet3D(
-        dim=int(input_size[0] / vae.config.downsample[0]), # 32
+    unet3d = PatchUnet3D(
+        dim=int(input_size[1] / vae.config.downsample[1]), # 32
+        cond_dim=1, # pheno dim (patch dim added internally by model)
         dim_mults=(1,2,4,8),
-        channels=int(vae.config.embedding_dim) # 8
+        channels=int(vae.config.embedding_dim), # 8
+        guide_mode='concat', ### 'concat'
+        low_res_guidance_channel=1, ###
     ).to(accelerator.device)
 
     # Create EMA for the unet.
     if args.use_ema:
-        ema_unet3d = Unet3D(
-            dim=int(input_size[0] / vae.config.downsample[0]),
+        ema_unet3d = PatchUnet3D(
+            dim=int(input_size[1] / vae.config.downsample[1]),
+            cond_dim=1, # age
             dim_mults=(1,2,4,8),
-            channels=int(vae.config.embedding_dim)
+            channels=int(vae.config.embedding_dim),
+            guide_mode='concat', ### 'concat'
+            low_res_guidance_channel=1, ###
         )
         ema_unet3d = EMAModel(
             ema_unet3d.parameters(), 
             decay=0.995,
             update_after_step=2000,
-            model_cls=Unet3D, 
+            model_cls=PatchUnet3D, 
             model_config=ema_unet3d.config
         )
 
-    noise_scheduler = GaussianDiffusion( # diffusers pipeline?
-        unet3d,
+    noise_scheduler = PatchGaussianDiffusion( # diffusers pipeline?
+        #unet3d,
         #vqgan_ckpt=cfg.model.vqgan_ckpt,
         #image_size=cfg.model.diffusion_img_size,
         #num_frames=cfg.model.diffusion_depth_size,
@@ -778,7 +979,7 @@ def main():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet3d_ema"), Unet3D)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet3d_ema"), PatchUnet3D)
                 ema_unet3d.load_state_dict(load_model.state_dict())
                 ema_unet3d.to(accelerator.device)
                 del load_model
@@ -789,7 +990,7 @@ def main():
 
                 # load diffusers style into model
                 if isinstance(model, type(accelerator.unwrap_model(unet3d))):
-                    load_model = Unet3D.from_pretrained(input_dir, subfolder="unet3d")
+                    load_model = PatchUnet3D.from_pretrained(input_dir, subfolder="unet3d")
                 else:
                     raise ValueError(f"unexpected load model: {model.__class__}")
 
@@ -849,7 +1050,7 @@ def main():
         [
             transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
             #transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
-            transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
+            #transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
@@ -858,8 +1059,8 @@ def main():
 
     with accelerator.main_process_first():
         if args.data_dir is not None: # args.test_data_dir is not None and args.data_dir is not None:
-            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
-            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, device=accelerator.device, axis=args.axis)
+            train_dataset = UKB_Dataset(args.data_dir, args.train_label_dir, transform=train_transforms, axis=args.axis)
+            valid_dataset = UKB_Dataset(args.data_dir, args.valid_label_dir, transform=train_transforms, axis=args.axis)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -936,7 +1137,8 @@ def main():
     #     model = accelerator.unwrap_model(model)
     #     model = model._orig_mod if is_compiled_module(model) else model
     #     return model
-    
+        
+   
 
 
     # ------------------------------ TRAIN ------------------------------ #
@@ -1016,12 +1218,15 @@ def main():
     progress_bar.set_description("Steps")
 
     # Model memory check
-    dummy_input = torch.ones(1, 8, 32, 32, 32).float().to(accelerator.device) # 262,144 for 64^3
-    timesteps = torch.randint(0, args.num_timesteps, (dummy_input.shape[0],)).long().to(accelerator.device)
-    unet3d.eval()
+    # dummy_input = torch.ones(1, 8, 38, 32, 32).float().to(accelerator.device) # 262,144 for 64^3
+    # low_res_input = torch.ones(1, 1, 38, 32, 32).float().to(accelerator.device)
+    # timesteps = torch.randint(0, args.num_timesteps, (dummy_input.shape[0],)).long().to(accelerator.device)
+    # cond = torch.tensor([0.5]).float().to(accelerator.device)
+    # patch_position = torch.tensor(13, dtype=torch.long).unsqueeze(0).to(accelerator.device)
+    # unet3d.eval()
 
-    unet3d_activations = count_activations(unet3d, dummy_input, timesteps)
-    print(f"### UNET3D's number of activations: {unet3d_activations:,}")
+    #unet3d_activations = count_activations(unet3d, dummy_input, timesteps, patch_position, cond, low_res_input)
+    #print(f"### UNET3D's number of activations: {unet3d_activations:,}")
     
     # Show model architecture and # of params
     # param_counts = count_parameters(unet3d)
@@ -1046,7 +1251,7 @@ def main():
             with accelerator.accumulate(unet3d):
                 with torch.autocast(accelerator.device.type, dtype=weight_dtype):
                     x = batch["pixel_values"].to(weight_dtype)
-
+                    
                     with torch.no_grad():
                         z = vae.encode(x, quantize=False, include_embeddings=True)
                         # normalize to -1 and 1 (apply scaling factor)
@@ -1054,10 +1259,7 @@ def main():
                                    (vae.codebook.embeddings.max() -
                                     vae.codebook.embeddings.min())) * 2.0 - 1.0
                     
-                    # directly condition the continuous values
-                    latents = torch.cat([latents, batch["normalized_age"].unsqueeze(-1).expand(-1, latents.shape[1])], dim=1)
-
-                    # print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
+                    print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
                     B = latents.shape[0]
                     check_shape(latents, 'b c f h w', 
                                 c=int(vae.config.embedding_dim), 
@@ -1078,13 +1280,18 @@ def main():
 
                     noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
 
-                    cond = None # TODO: implement label conditioning embedding
-                    cond = batch["age"] #####
+                    # conditioning
+                    cond = batch["condition"].to(latents.device)
                     if is_list_str(cond):
                         cond = bert_embed(tokenize(cond), return_cls_repr=False)
                         cond = cond.to(latents.device)
 
-                    z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond)
+                    z_pred = unet3d(x=noisy_latents, 
+                                    time=timesteps, 
+                                    patch_position=batch["patch_position"], 
+                                    low_res_guidance=batch["lowres_guide"],
+                                    cond=cond, 
+                                    null_cond_prob=0.1)
 
                     if args.loss_type == 'l1':
                         loss = F.l1_loss(noise, z_pred)
@@ -1175,7 +1382,7 @@ def main():
                     # validation
                     if accelerator.is_main_process:
                         print("### Start validation ###")
-                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, epoch, args.num_samples)
+                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, global_step, args.num_samples, save_path)
                     
                     with torch.no_grad():
                         vae.eval()
@@ -1211,12 +1418,17 @@ def main():
 
                                 noisy_latents = noise_scheduler.q_sample(x_start=latents, t=timesteps, noise=noise)
 
-                                cond = None # TODO: implement label conditioning embedding
+                                # conditioning
+                                cond = batch["condition"].to(latents.device)
                                 if is_list_str(cond):
                                     cond = bert_embed(tokenize(cond), return_cls_repr=False)
                                     cond = cond.to(latents.device)
 
-                                z_pred = unet3d(x=noisy_latents, time=timesteps, cond=cond)
+                                z_pred = unet3d(x=noisy_latents, 
+                                                time=timesteps, 
+                                                patch_position=batch["patch_position"], 
+                                                low_res_guidance=batch["lowres_guide"],
+                                                cond=cond)
 
                                 if args.loss_type == 'l1':
                                     val_loss = F.l1_loss(noise, z_pred)
