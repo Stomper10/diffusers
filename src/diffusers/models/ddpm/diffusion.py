@@ -1199,16 +1199,14 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         block_type: str = 'resnet',
         resnet_groups: int = 8,
         num_patch_positions: int = 27, ###
-        guide_mode: str = 'emb', ### 'concat' or 'emb'
         patch_position_embedding_dim: int = 16, ###
-        low_res_guidance_channel: int = 0, ###
-        guidance_dim: int = 64,  ### Example value
-        guidance_embedding_dim: int = 0, ### 128
+        low_res_guidance_channel: int = 1, ###
+        guidance_dim: int = 64,  ###
+        #guidance_embedding_dim: int = 128, ###
     ):
         super().__init__()
 
         # temporal attention and its relative positional encoding
-
         rotary_emb = RotaryEmbedding(min(32, attn_dim_head))
 
         def temporal_attn(dim): return EinopsToAndFrom('b c f h w', 'b (h w) f c', Attention(
@@ -1219,15 +1217,10 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
             heads=attn_heads, max_distance=32)
 
         # initial conv
-
         init_dim = default(init_dim, dim)
         assert is_odd(init_kernel_size)
 
         init_padding = init_kernel_size // 2
-
-        self.guide_mode = guide_mode
-        if self.guide_mode == 'concat':
-            channels += low_res_guidance_channel
 
         self.init_conv = nn.Conv3d(channels, init_dim, (1, init_kernel_size, ###
                                    init_kernel_size), padding=(0, init_padding, init_padding))
@@ -1236,7 +1229,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
             PreNorm(init_dim, temporal_attn(init_dim)))
 
         # dimensions
-
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
@@ -1247,7 +1239,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         )
 
         # time conditioning
-
         time_dim = dim * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
@@ -1257,29 +1248,25 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         )
 
         # text conditioning
-
         self.has_cond = exists(cond_dim) or use_bert_text_cond
         cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
 
         self.null_cond_emb = nn.Parameter(
             torch.randn(1, cond_dim)) if self.has_cond else None
 
-        cond_dim = time_dim + int(cond_dim or 0) + patch_position_embedding_dim + guidance_embedding_dim
+        cond_dim = time_dim + int(cond_dim or 0) + patch_position_embedding_dim
 
         # layers
-
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
 
         num_resolutions = len(in_out)
 
         # block type
-
         block_klass = partial(ResnetBlock, groups=resnet_groups)
         block_klass_cond = partial(block_klass, time_emb_dim=cond_dim)
 
         # modules for all layers
-
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
@@ -1318,34 +1305,39 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
 
         out_dim = default(out_dim, channels)
 
-        if self.guide_mode == 'concat':
-            out_dim -= low_res_guidance_channel
-
         self.final_conv = nn.Sequential(
             block_klass(dim * 2, dim),
             nn.Conv3d(dim, out_dim, 1)
         )
-
-        if self.guide_mode == 'emb':
+        print("### mid_dim:", mid_dim)
+        if low_res_guidance_channel is not None:
             self.low_res_encoder = nn.Sequential(
                 SamePadConv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding_type="replicate"),
                 #nn.Conv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool3d(1),  # Global pooling to get a feature vector
-                nn.Flatten(),
-                nn.Linear(guidance_dim, guidance_embedding_dim),
-                nn.ReLU()
+                nn.SiLU(),
+                SamePadConv3d(guidance_dim, guidance_dim, kernel_size=3, padding_type="replicate"),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool3d((4, 4, 4)),
+                # nn.AdaptiveAvgPool3d(1), # Global pooling to get a feature vector
+                # nn.Flatten(),
+                # nn.Linear(guidance_dim, guidance_embedding_dim),
+                # nn.ReLU()
             )
 
-        # After setting guide_mode and building low_res_encoder, define film_mlp:
-        if guidance_embedding_dim > 0:
+            # self.film_mlp = nn.Sequential(
+            #     nn.Linear(guidance_embedding_dim, 2 * mid_dim)
+            #     # Optionally add an activation if needed:
+            #     # nn.Linear(guidance_embedding_dim, 2 * mid_dim),
+            #     # nn.ReLU(), # If you prefer a nonlinear transformation
+            # )
             self.film_mlp = nn.Sequential(
-                nn.Linear(guidance_embedding_dim, 2 * mid_dim)
-                # Optionally add an activation if needed:
-                # nn.Linear(guidance_embedding_dim, 2 * mid_dim),
-                # nn.ReLU(), # If you prefer a nonlinear transformation
+                nn.Linear(guidance_dim, guidance_dim*4),
+                nn.SiLU(),
+                nn.Linear(guidance_dim*4, 2 * mid_dim)
+                # Optional: add activation here if desired
             )
         else:
+            self.low_res_encoder = None
             self.film_mlp = None
 
     def forward_with_cond_scale(
@@ -1382,12 +1374,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
 
         time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
 
-        guidance_emb = None
-        if self.guide_mode == 'emb':
-            guidance_emb = self.low_res_encoder(low_res_guidance)
-        elif self.guide_mode == 'concat' and low_res_guidance is not None:
-            x = torch.cat([x, low_res_guidance], dim=1)
-
         x = self.init_conv(x)
         r = x.clone()
 
@@ -1401,16 +1387,14 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         # print("### guidance_emb.shape:", guidance_emb.shape)
 
         cond_emb_list = [t, patch_pos_emb]
+        
         # classifier free guidance
-
         if self.has_cond:
             batch, device = x.shape[0], x.device
             mask = prob_mask_like((batch,), null_cond_prob, device=device)
             cond = torch.where(rearrange(mask, 'b -> b 1'),
                                self.null_cond_emb, cond)
             cond_emb_list.append(cond)
-            #t = torch.cat((t, patch_pos_emb, cond, guidance_emb), dim=-1)
-            #t = torch.cat((t, cond), dim=-1)
         
         # Concatenate all conditioning embeddings
         t = torch.cat([emb for emb in cond_emb_list if emb is not None], dim=-1)
@@ -1426,9 +1410,17 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
             h.append(x)
             x = downsample(x)
 
-        if guidance_emb is not None:
-            scale_shift_params = self.film_mlp(guidance_emb) # MLP on guidance_emb
+        if low_res_guidance is not None:
+            #guidance_emb = self.low_res_encoder(low_res_guidance)
+            guidance_grid = self.low_res_encoder(low_res_guidance)  # shape [B, guidance_dim, 4,4,4]
+            guidance_global = guidance_grid.mean(dim=[2,3,4]) # shape [B, guidance_dim]
+            scale_shift_params = self.film_mlp(guidance_global) # MLP on guidance_emb
             scale, shift = scale_shift_params.chunk(2, dim=-1)
+            
+            # Add a mild activation to constrain scale and shift, e.g.:
+            scale = torch.tanh(scale) * 0.5  # scale in range [-0.5, 0.5]
+            shift = torch.tanh(shift) * 0.5  # shift in range [-0.5, 0.5]
+
             # reshape scale, shift to match x's spatial dimensions
             scale = scale[:, :, None, None, None]
             shift = shift[:, :, None, None, None]
