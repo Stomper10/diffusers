@@ -23,15 +23,38 @@ The abstract from the paper is:
 
 <Tip>
 
-Make sure to check out the Schedulers [guide](../../using-diffusers/schedulers.md) to learn how to explore the tradeoff between scheduler speed and quality, and see the [reuse components across pipelines](../../using-diffusers/loading.md#reuse-a-pipeline) section to learn how to efficiently load the same components into multiple pipelines.
+Make sure to check out the Schedulers [guide](../../using-diffusers/schedulers) to learn how to explore the tradeoff between scheduler speed and quality, and see the [reuse components across pipelines](../../using-diffusers/loading.md#reuse-a-pipeline) section to learn how to efficiently load the same components into multiple pipelines.
 
 </Tip>
 
 This pipeline was contributed by [zRzRzRzRzRzRzR](https://github.com/zRzRzRzRzRzRzR). The original codebase can be found [here](https://huggingface.co/THUDM). The original weights can be found under [hf.co/THUDM](https://huggingface.co/THUDM).
 
-There are two models available that can be used with the CogVideoX pipeline:
-- [`THUDM/CogVideoX-2b`](https://huggingface.co/THUDM/CogVideoX-2b)
-- [`THUDM/CogVideoX-5b`](https://huggingface.co/THUDM/CogVideoX-5b)
+There are three official CogVideoX checkpoints for text-to-video and video-to-video.
+
+| checkpoints | recommended inference dtype |
+|:---:|:---:|
+| [`THUDM/CogVideoX-2b`](https://huggingface.co/THUDM/CogVideoX-2b) | torch.float16 |
+| [`THUDM/CogVideoX-5b`](https://huggingface.co/THUDM/CogVideoX-5b) | torch.bfloat16 |
+| [`THUDM/CogVideoX1.5-5b`](https://huggingface.co/THUDM/CogVideoX1.5-5b) | torch.bfloat16 |
+
+There are two official CogVideoX checkpoints available for image-to-video.
+
+| checkpoints | recommended inference dtype |
+|:---:|:---:|
+| [`THUDM/CogVideoX-5b-I2V`](https://huggingface.co/THUDM/CogVideoX-5b-I2V) | torch.bfloat16 |
+| [`THUDM/CogVideoX-1.5-5b-I2V`](https://huggingface.co/THUDM/CogVideoX-1.5-5b-I2V) | torch.bfloat16 |
+
+For the CogVideoX 1.5 series:
+- Text-to-video (T2V) works best at a resolution of 1360x768 because it was trained with that specific resolution.
+- Image-to-video (I2V) works for multiple resolutions. The width can vary from 768 to 1360, but the height must be 768. The height/width must be divisible by 16.
+- Both T2V and I2V models support generation with 81 and 161 frames and work best at this value. Exporting videos at 16 FPS is recommended.
+
+There are two official CogVideoX checkpoints that support pose controllable generation (by the [Alibaba-PAI](https://huggingface.co/alibaba-pai) team).
+
+| checkpoints | recommended inference dtype |
+|:---:|:---:|
+| [`alibaba-pai/CogVideoX-Fun-V1.1-2b-Pose`](https://huggingface.co/alibaba-pai/CogVideoX-Fun-V1.1-2b-Pose) | torch.bfloat16 |
+| [`alibaba-pai/CogVideoX-Fun-V1.1-5b-Pose`](https://huggingface.co/alibaba-pai/CogVideoX-Fun-V1.1-5b-Pose) | torch.bfloat16 |
 
 ## Inference
 
@@ -41,10 +64,15 @@ First, load the pipeline:
 
 ```python
 import torch
-from diffusers import CogVideoXPipeline
-from diffusers.utils import export_to_video
+from diffusers import CogVideoXPipeline, CogVideoXImageToVideoPipeline
+from diffusers.utils import export_to_video,load_image
+pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-5b").to("cuda") # or "THUDM/CogVideoX-2b" 
+```
 
-pipe = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b").to("cuda")
+If you are using the image-to-video pipeline, load it as follows:
+
+```python
+pipe = CogVideoXImageToVideoPipeline.from_pretrained("THUDM/CogVideoX-5b-I2V").to("cuda")
 ```
 
 Then change the memory layout of the pipelines `transformer` component to `torch.channels_last`:
@@ -53,7 +81,7 @@ Then change the memory layout of the pipelines `transformer` component to `torch
 pipe.transformer.to(memory_format=torch.channels_last)
 ```
 
-Finally, compile the components and run inference:
+Compile the components and run inference:
 
 ```python
 pipe.transformer = torch.compile(pipeline.transformer, mode="max-autotune", fullgraph=True)
@@ -63,7 +91,7 @@ prompt = "A panda, dressed in a small, red jacket and a tiny hat, sits on a wood
 video = pipe(prompt=prompt, guidance_scale=6, num_inference_steps=50).frames[0]
 ```
 
-The [benchmark](https://gist.github.com/a-r-r-o-w/5183d75e452a368fd17448fcc810bd3f) results on an 80GB A100 machine are:
+The [T2V benchmark](https://gist.github.com/a-r-r-o-w/5183d75e452a368fd17448fcc810bd3f) results on an 80GB A100 machine are:
 
 ```
 Without torch.compile(): Average inference time: 96.89 seconds.
@@ -77,9 +105,53 @@ CogVideoX-2b requires about 19 GB of GPU memory to decode 49 frames (6 seconds o
 - `pipe.enable_model_cpu_offload()`:
   - Without enabling cpu offloading, memory usage is `33 GB`
   - With enabling cpu offloading, memory usage is `19 GB`
+- `pipe.enable_sequential_cpu_offload()`:
+  - Similar to `enable_model_cpu_offload` but can significantly reduce memory usage at the cost of slow inference
+  - When enabled, memory usage is under `4 GB`
 - `pipe.vae.enable_tiling()`:
   - With enabling cpu offloading and tiling, memory usage is `11 GB`
 - `pipe.vae.enable_slicing()`
+
+## Quantization
+
+Quantization helps reduce the memory requirements of very large models by storing model weights in a lower precision data type. However, quantization may have varying impact on video quality depending on the video model.
+
+Refer to the [Quantization](../../quantization/overview) overview to learn more about supported quantization backends and selecting a quantization backend that supports your use case. The example below demonstrates how to load a quantized [`CogVideoXPipeline`] for inference with bitsandbytes.
+
+```py
+import torch
+from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig, CogVideoXTransformer3DModel, CogVideoXPipeline
+from diffusers.utils import export_to_video
+from transformers import BitsAndBytesConfig as BitsAndBytesConfig, T5EncoderModel
+
+quant_config = BitsAndBytesConfig(load_in_8bit=True)
+text_encoder_8bit = T5EncoderModel.from_pretrained(
+    "THUDM/CogVideoX-2b",
+    subfolder="text_encoder",
+    quantization_config=quant_config,
+    torch_dtype=torch.float16,
+)
+
+quant_config = DiffusersBitsAndBytesConfig(load_in_8bit=True)
+transformer_8bit = CogVideoXTransformer3DModel.from_pretrained(
+    "THUDM/CogVideoX-2b",
+    subfolder="transformer",
+    quantization_config=quant_config,
+    torch_dtype=torch.float16,
+)
+
+pipeline = CogVideoXPipeline.from_pretrained(
+    "THUDM/CogVideoX-2b",
+    text_encoder=text_encoder_8bit,
+    transformer=transformer_8bit,
+    torch_dtype=torch.float16,
+    device_map="balanced",
+)
+
+prompt = "A detailed wooden toy ship with intricately carved masts and sails is seen gliding smoothly over a plush, blue carpet that mimics the waves of the sea. The ship's hull is painted a rich brown, with tiny windows. The carpet, soft and textured, provides a perfect backdrop, resembling an oceanic expanse. Surrounding the ship are various other toys and children's items, hinting at a playful environment. The scene captures the innocence and imagination of childhood, with the toy ship's journey symbolizing endless adventures in a whimsical, indoor setting."
+video = pipeline(prompt=prompt, guidance_scale=6, num_inference_steps=50).frames[0]
+export_to_video(video, "ship.mp4", fps=8)
+```
 
 ## CogVideoXPipeline
 
@@ -87,6 +159,24 @@ CogVideoX-2b requires about 19 GB of GPU memory to decode 49 frames (6 seconds o
   - all
   - __call__
 
+## CogVideoXImageToVideoPipeline
+
+[[autodoc]] CogVideoXImageToVideoPipeline
+  - all
+  - __call__
+
+## CogVideoXVideoToVideoPipeline
+
+[[autodoc]] CogVideoXVideoToVideoPipeline
+  - all
+  - __call__
+
+## CogVideoXFunControlPipeline
+
+[[autodoc]] CogVideoXFunControlPipeline
+  - all
+  - __call__
+
 ## CogVideoXPipelineOutput
 
-[[autodoc]] pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipelineOutput
+[[autodoc]] pipelines.cogvideo.pipeline_output.CogVideoXPipelineOutput

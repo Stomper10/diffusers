@@ -21,7 +21,7 @@ from diffusers import (
 from diffusers.models.attention import FreeNoiseTransformerBlock
 from diffusers.utils import logging
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.testing_utils import torch_device
+from diffusers.utils.testing_utils import require_accelerator, torch_device
 
 from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_PARAMS
 from ..test_pipelines_common import (
@@ -193,7 +193,7 @@ class AnimateDiffControlNetPipelineFastTests(
     def test_attention_slicing_forward_pass(self):
         pass
 
-    def test_ip_adapter_single(self):
+    def test_ip_adapter(self):
         expected_pipe_slice = None
         if torch_device == "cpu":
             expected_pipe_slice = np.array(
@@ -218,7 +218,7 @@ class AnimateDiffControlNetPipelineFastTests(
                     0.5155,
                 ]
             )
-        return super().test_ip_adapter_single(expected_pipe_slice=expected_pipe_slice)
+        return super().test_ip_adapter(expected_pipe_slice=expected_pipe_slice)
 
     def test_dict_tuple_outputs_equivalent(self):
         expected_slice = None
@@ -281,7 +281,7 @@ class AnimateDiffControlNetPipelineFastTests(
         max_diff = np.abs(to_np(output_batch[0][0]) - to_np(output[0][0])).max()
         assert max_diff < expected_max_diff
 
-    @unittest.skipIf(torch_device != "cuda", reason="CUDA and CPU are required to switch devices")
+    @require_accelerator
     def test_to_device(self):
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
@@ -297,14 +297,14 @@ class AnimateDiffControlNetPipelineFastTests(
         output_cpu = pipe(**self.get_dummy_inputs("cpu"))[0]
         self.assertTrue(np.isnan(output_cpu).sum() == 0)
 
-        pipe.to("cuda")
+        pipe.to(torch_device)
         model_devices = [
             component.device.type for component in pipe.components.values() if hasattr(component, "device")
         ]
-        self.assertTrue(all(device == "cuda" for device in model_devices))
+        self.assertTrue(all(device == torch_device for device in model_devices))
 
-        output_cuda = pipe(**self.get_dummy_inputs("cuda"))[0]
-        self.assertTrue(np.isnan(to_np(output_cuda)).sum() == 0)
+        output_device = pipe(**self.get_dummy_inputs(torch_device))[0]
+        self.assertTrue(np.isnan(to_np(output_device)).sum() == 0)
 
     def test_to_dtype(self):
         components = self.get_dummy_components()
@@ -475,6 +475,27 @@ class AnimateDiffControlNetPipelineFastTests(
                     1e-4,
                     "Disabling of FreeNoise should lead to results similar to the default pipeline results",
                 )
+
+    def test_free_noise_multi_prompt(self):
+        components = self.get_dummy_components()
+        pipe: AnimateDiffControlNetPipeline = self.pipeline_class(**components)
+        pipe.set_progress_bar_config(disable=None)
+        pipe.to(torch_device)
+
+        context_length = 8
+        context_stride = 4
+        pipe.enable_free_noise(context_length, context_stride)
+
+        # Make sure that pipeline works when prompt indices are within num_frames bounds
+        inputs = self.get_dummy_inputs(torch_device, num_frames=16)
+        inputs["prompt"] = {0: "Caterpillar on a leaf", 10: "Butterfly on a leaf"}
+        pipe(**inputs).frames[0]
+
+        with self.assertRaises(ValueError):
+            # Ensure that prompt indices are within bounds
+            inputs = self.get_dummy_inputs(torch_device, num_frames=16)
+            inputs["prompt"] = {0: "Caterpillar on a leaf", 10: "Butterfly on a leaf", 42: "Error on a leaf"}
+            pipe(**inputs).frames[0]
 
     def test_vae_slicing(self, video_count=2):
         device = "cpu"  # ensure determinism for the device-dependent torch.Generator
