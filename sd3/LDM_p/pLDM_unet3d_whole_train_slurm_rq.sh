@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=E4_pLDM_UNET3D_noguide
+#SBATCH --job-name=E8_pLDM_UNET3D_whole
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=P2
-#SBATCH --time=0-6:00:00
+#SBATCH --time=0-12:00:00
 #SBATCH --mem=50GB
 #SBATCH --cpus-per-task=8
 #SBATCH --signal=B:SIGUSR1@30
@@ -40,7 +40,7 @@ export JOB_NAME=$SLURM_JOB_NAME
 export VAE_PATH="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/E1_pLDM_VQGAN3D/checkpoint-770000"
 
 accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/config_single.yaml \
-    /shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/train_unet3d_noguide.py \
+    /shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/train_unet3d_whole.py \
     --pretrained_vae_path=$VAE_PATH \
     --data_dir="/shared/s1/lab06/20252_individual_samples" \
     --train_label_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/data/ukbb_cn_train.csv" \
@@ -48,7 +48,7 @@ accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/c
     --output_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/$JOB_NAME" \
     --resume_from_checkpoint="latest" \
     --axis="c" \
-    --dim_mults="1,2,4,8,16" \
+    --dim_mults="4,8,16,32" \
     --attn_heads=16 \
     --seed=42 \
     --allow_tf32 \

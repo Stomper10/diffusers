@@ -1200,9 +1200,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         resnet_groups: int = 8,
         num_patch_positions: int = 27, ###
         patch_position_embedding_dim: int = 16, ###
-        low_res_guidance_channel: int = 1, ###
-        guidance_dim: int = 64,  ###
-        #guidance_embedding_dim: int = 128, ###
     ):
         super().__init__()
 
@@ -1309,36 +1306,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
             block_klass(dim * 2, dim),
             nn.Conv3d(dim, out_dim, 1)
         )
-        print("### mid_dim:", mid_dim)
-        if low_res_guidance_channel is not None:
-            self.low_res_encoder = nn.Sequential(
-                SamePadConv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding_type="replicate"),
-                #nn.Conv3d(low_res_guidance_channel, guidance_dim, kernel_size=3, padding=1),
-                nn.SiLU(),
-                SamePadConv3d(guidance_dim, guidance_dim, kernel_size=3, padding_type="replicate"),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool3d((4, 4, 4)),
-                # nn.AdaptiveAvgPool3d(1), # Global pooling to get a feature vector
-                # nn.Flatten(),
-                # nn.Linear(guidance_dim, guidance_embedding_dim),
-                # nn.ReLU()
-            )
-
-            # self.film_mlp = nn.Sequential(
-            #     nn.Linear(guidance_embedding_dim, 2 * mid_dim)
-            #     # Optionally add an activation if needed:
-            #     # nn.Linear(guidance_embedding_dim, 2 * mid_dim),
-            #     # nn.ReLU(), # If you prefer a nonlinear transformation
-            # )
-            self.film_mlp = nn.Sequential(
-                nn.Linear(guidance_dim, guidance_dim*4),
-                nn.SiLU(),
-                nn.Linear(guidance_dim*4, 2 * mid_dim)
-                # Optional: add activation here if desired
-            )
-        else:
-            self.low_res_encoder = None
-            self.film_mlp = None
 
     def forward_with_cond_scale(
         self,
@@ -1358,7 +1325,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         x,
         time,
         patch_position, ###
-        low_res_guidance=None, ###
         cond=None,
         null_cond_prob=0.,
         focus_present_mask=None,
@@ -1409,22 +1375,6 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
                               focus_present_mask=focus_present_mask)
             h.append(x)
             x = downsample(x)
-
-        if low_res_guidance is not None:
-            #guidance_emb = self.low_res_encoder(low_res_guidance)
-            guidance_grid = self.low_res_encoder(low_res_guidance)  # shape [B, guidance_dim, 4,4,4]
-            guidance_global = guidance_grid.mean(dim=[2,3,4]) # shape [B, guidance_dim]
-            scale_shift_params = self.film_mlp(guidance_global) # MLP on guidance_emb
-            scale, shift = scale_shift_params.chunk(2, dim=-1)
-            
-            # Add a mild activation to constrain scale and shift, e.g.:
-            scale = torch.tanh(scale) * 0.5  # scale in range [-0.5, 0.5]
-            shift = torch.tanh(shift) * 0.5  # shift in range [-0.5, 0.5]
-
-            # reshape scale, shift to match x's spatial dimensions
-            scale = scale[:, :, None, None, None]
-            shift = shift[:, :, None, None, None]
-            x = x * (scale + 1) + shift
 
         x = self.mid_block1(x, t)
         x = self.mid_spatial_attn(x)
@@ -1554,9 +1504,9 @@ class PatchGaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, unet, x, t, clip_denoised: bool, patch_position, low_res_guidance=None, cond=None, cond_scale=1.): ###
+    def p_mean_variance(self, unet, x, t, clip_denoised: bool, patch_position, cond=None, cond_scale=1.): ###
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=unet.forward_with_cond_scale(x, t, patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale)) ###
+            x, t=t, noise=unet.forward_with_cond_scale(x, t, patch_position, cond=cond, cond_scale=cond_scale)) ###
 
         if clip_denoised:
             s = 1.
@@ -1578,10 +1528,10 @@ class PatchGaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, unet, x, t, patch_position, low_res_guidance=None, cond=None, cond_scale=1., clip_denoised=True): ###
+    def p_sample(self, unet, x, t, patch_position, cond=None, cond_scale=1., clip_denoised=True): ###
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            unet, x=x, t=t, clip_denoised=clip_denoised, patch_position=patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale) ###
+            unet, x=x, t=t, clip_denoised=clip_denoised, patch_position=patch_position, cond=cond, cond_scale=cond_scale) ###
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -1589,7 +1539,7 @@ class PatchGaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, unet, shape, patch_position, low_res_guidance=None, cond=None, cond_scale=1.): ###
+    def p_sample_loop(self, unet, shape, patch_position, cond=None, cond_scale=1.): ###
         device = self.betas.device
 
         b = shape[0]
@@ -1597,12 +1547,12 @@ class PatchGaussianDiffusion(nn.Module):
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(unet, img, torch.full( ###
-                (b,), i, device=device, dtype=torch.long), patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), patch_position, cond=cond, cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
-    def sample(self, vae, unet, image_size, num_frames, channels, patch_position, low_res_guidance=None, cond=None, cond_scale=1., batch_size=16): ###
+    def sample(self, vae, unet, image_size, num_frames, channels, patch_position, cond=None, cond_scale=1., batch_size=16): ###
         device = next(unet.parameters()).device
 
         if is_list_str(cond):
@@ -1613,7 +1563,7 @@ class PatchGaussianDiffusion(nn.Module):
         # channels = self.channels
         # num_frames = self.num_frames
         _sample = self.p_sample_loop(
-            unet, (batch_size, channels, num_frames, image_size, image_size), patch_position, low_res_guidance=low_res_guidance, cond=cond, cond_scale=cond_scale) ###
+            unet, (batch_size, channels, num_frames, image_size, image_size), patch_position, cond=cond, cond_scale=cond_scale) ###
 
         if isinstance(vae, VQGAN):
             # denormalize TODO: Remove eventually

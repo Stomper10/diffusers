@@ -82,25 +82,6 @@ if is_wandb_available():
 check_min_version("0.28.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
-# def get_model_checksum(model):
-#     checksum = 0
-#     for param in model.parameters():
-#         checksum += param.detach().sum().item()
-#     return checksum
-
-# def log_norm_layer_params(model, description=""):
-#     """
-#     Log the parameters of LayerNorm and GroupNorm layers in the model.
-#     Args:
-#         model (torch.nn.Module): The model containing the normalization layers.
-#         description (str): Description to include in the log for context (e.g., "before saving").
-#     """
-#     for name, layer in model.named_modules():
-#         if isinstance(layer, (nn.LayerNorm, nn.GroupNorm)):
-#             logger.info(f"{description} - {name} - weight: {layer.weight.sum().item()}, bias: {layer.bias.sum().item()}")
-
-
-
 @torch.no_grad()
 def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, gloabal_step, num_samples, save_dir):
     logger.info("Running validation... ")
@@ -117,76 +98,15 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
         x = batch["pixel_values"][:num_samples]
         cond = batch["condition"][:num_samples]
         patch_position = batch["patch_position"][:num_samples]
-        low_res_guidance = batch["lowres_guide"][:num_samples]
         
         for i in range(num_samples):
-            
-            # patch_index = 13
-            # cond = torch.tensor([0.5], dtype=torch.float16).to(unet3d.device)
-            # patch_position = torch.tensor(patch_index, dtype=torch.long).unsqueeze(0).to(unet3d.device)
-            # lowres_guide = torch.load("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/low-res_gen/tensor_low-res_image_origin.pth").to(torch.float64).to(unet3d.device)
-
-            # lowres_guide = F.interpolate(
-            #     lowres_guide,
-            #     size=(218, 182, 182),
-            #     mode='trilinear',
-            #     align_corners=False
-            # )
-            # lowres_guide = lowres_guide.squeeze(0).to(torch.float16)
-
-            # # Initialize lists
-            # depth_starts = [0, 71, 142]
-            # height_starts = [0, 59, 118]
-            # width_starts = [0, 59, 118]
-
-            # # Initialize index
-            # index = 0
-            # # Mapping list to store results
-            # mapping = []
-
-            # for id, start_d in enumerate(depth_starts):
-            #     for ih, start_h in enumerate(height_starts):
-            #         for iw, start_w in enumerate(width_starts):
-            #             mapping.append({
-            #                 'index': index,
-            #                 'start_d': start_d,
-            #                 'start_h': start_h,
-            #                 'start_w': start_w
-            #             })
-            #             print(f"Index: {index}, Start Coordinates: (D: {start_d}, H: {start_h}, W: {start_w})")
-            #             index += 1
-
-            # mapping_entry = mapping[patch_index] ###
-            # start_d = mapping_entry['start_d']
-            # start_h = mapping_entry['start_h']
-            # start_w = mapping_entry['start_w']
-            
-            # # Patch dimensions
-            # pd, ph, pw = 76, 64, 64
-            
-            # # Extract the patch
-            # patch = lowres_guide[
-            #     :, 
-            #     start_d:start_d + pd,
-            #     start_h:start_h + ph,
-            #     start_w:start_w + pw
-            # ]
-
-            # low_res_guidance = F.interpolate(
-            #     patch.unsqueeze(0).to(torch.float64),
-            #     size=(38, 32, 32),
-            #     mode='trilinear',
-            #     align_corners=False
-            # ).to(torch.float16)
-            
             image = noise_scheduler.sample(vae=vae,
                                         unet=unet3d,
                                         image_size=int(input_size[1] / vae.config.downsample[1]),
                                         num_frames=int(input_size[0] / vae.config.downsample[0]),
                                         channels=int(vae.config.embedding_dim),
                                         patch_position=patch_position[i].unsqueeze(0), ###
-                                        low_res_guidance=None, ###
-                                        cond=cond[i].unsqueeze(0), #####
+                                        cond=cond[i].unsqueeze(0), ###
                                         cond_scale=1., ###
                                         batch_size=1
                                         )
@@ -206,22 +126,6 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("Original (left), Reconstruction (right)", np_images, gloabal_step)
         elif tracker.name == "wandb":
-            # tracker.log(
-            #     {
-            #         "validation Sagittal": [
-            #             wandb.Image(image[:, :, image.shape[2] // 2, :, :].squeeze(), caption=f"{i}: Uncond generation.")
-            #             for i, image in enumerate(images)
-            #         ],
-            #         "validation Coronal": [
-            #             wandb.Image(image[:, :, :, image.shape[3] // 2, :].squeeze(), caption=f"{i}: Uncond generation.")
-            #             for i, image in enumerate(images)
-            #         ],
-            #         "validation Axial": [
-            #             wandb.Image(image[:, :, :, :, image.shape[4] // 2].squeeze(), caption=f"{i}: Uncond generation.")
-            #             for i, image in enumerate(images)
-            #         ]
-            #     }
-            # )=
             tracker.log(
                 {
                     "Original (left), Generation (right) - Sagittal": [
@@ -326,19 +230,6 @@ def count_parameters(model):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="UNET3D training script.")
-    # parser.add_argument(
-    #     "--revision",
-    #     type=str,
-    #     default=None,
-    #     required=False,
-    #     help="Revision of pretrained model identifier from huggingface.co/models.",
-    # )
-    # parser.add_argument(
-    #     "--variant",
-    #     type=str,
-    #     default=None,
-    #     help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    # )
     parser.add_argument(
         "--axis",
         type=str,
@@ -410,30 +301,12 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
-    # parser.add_argument(
-    #     "--image_column", type=str, default="image", help="The column of the dataset containing an image.",
-    # )
-    # parser.add_argument(
-    #     "--max_train_samples",
-    #     type=int,
-    #     default=None,
-    #     help=(
-    #         "For debugging purposes or quicker training, truncate the number of training examples to this "
-    #         "value if set."
-    #     ),
-    # )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="outputs",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
-    # parser.add_argument(
-    #     "--cache_dir",
-    #     type=str,
-    #     default=None,
-    #     help="The directory where the downloaded models and datasets will be stored.",
-    # )
     parser.add_argument("--seed", type=int, default=21, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
@@ -444,20 +317,6 @@ def parse_args():
             " resolution"
         ),
     )
-    # parser.add_argument(
-    #     "--center_crop",
-    #     default=False,
-    #     action="store_true",
-    #     help=(
-    #         "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-    #         " cropped. The images will be resized to the resolution first before cropping."
-    #     ),
-    # )
-    # parser.add_argument(
-    #     "--random_flip",
-    #     action="store_true",
-    #     help="whether to randomly flip images horizontally",
-    # )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader.",
     )
@@ -503,9 +362,6 @@ def parse_args():
             ' "constant", "constant_with_warmup", "piecewise_constant"]'
         ),
     )
-    # parser.add_argument(
-    #     "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler.",
-    # )
     parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
@@ -518,16 +374,6 @@ def parse_args():
         ),
     )
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
-    # parser.add_argument(
-    #     "--non_ema_revision",
-    #     type=str,
-    #     default=None,
-    #     required=False,
-    #     help=(
-    #         "Revision of pretrained non-ema model identifier. Must be a branch, tag or git identifier of the local or"
-    #         " remote repository specified with --pretrained_model_name_or_path."
-    #     ),
-    # )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -607,12 +453,6 @@ def parse_args():
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
-    # parser.add_argument(
-    #     "--validation_epochs",
-    #     type=int,
-    #     default=5,
-    #     help="Run validation every X epochs.",
-    # )
     parser.add_argument(
         "--tracker_project_name",
         type=str,
@@ -623,40 +463,6 @@ def parse_args():
         ),
     )
     parser.add_argument("--num_samples", type=int, default=5, help="The number of samples for validation.")
-    # parser.add_argument(
-    #     "--kl_scale",
-    #     type=float,
-    #     default=1e-6,
-    #     help="Scaling factor for the Kullback-Leibler divergence penalty term.",
-    # )
-    # parser.add_argument(
-    #     "--lpips_scale",
-    #     type=float,
-    #     default=5e-1,
-    #     help="Scaling factor for the LPIPS metric",
-    # )
-    # parser.add_argument(
-    #     "--lpips_start",
-    #     type=int,
-    #     default=50001,
-    #     help="Start for the LPIPS metric",
-    # )
-    # parser.add_argument(
-    #     "--tile_sample_size",
-    #     type=int,
-    #     default=None,
-    #     help="Start for the LPIPS metric",
-    # )
-    # parser.add_argument(
-    #     "--slicing",
-    #     action="store_true",
-    #     help="Enable sliced VAE (process single batch at a time)",
-    # )
-    # parser.add_argument(
-    #     "--tiling",
-    #     action="store_true",
-    #     help="Enable tiling VAE (process divided image)",
-    # )    
     args = parser.parse_args()
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -667,10 +473,6 @@ def parse_args():
     if args.data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
     
-    # default to using the same revision for the non-ema model if not specified
-    # if args.non_ema_revision is None:
-    #     args.non_ema_revision = args.revision
-
     return args
 
 
@@ -744,9 +546,6 @@ class UKB_Dataset(Dataset):
                     print(f"Index: {index}, Start Coordinates: (D: {start_d}, H: {start_h}, W: {start_w})")
                     index += 1
 
-        # low-res guidance
-        #self.lowres_guidance = torch.load("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/low-res_gen/tensor_low-res_image_origin.pth").to(torch.float64)
-
     def get_patch_by_index(self, volume, index, mapping):
         # Retrieve the start coordinates from the mapping
         mapping_entry = mapping[index]
@@ -796,7 +595,6 @@ class UKB_Dataset(Dataset):
 
         # Define target size
         target_size = (218, 182, 182)  # (D₂, H₂, W₂)
-        lowres_size = (76, 64, 64)
 
         # Resize the volume using trilinear interpolation
         image = F.interpolate(
@@ -805,33 +603,17 @@ class UKB_Dataset(Dataset):
             mode='trilinear',
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
-        lowres_guide = F.interpolate(
-            image,
-            size=lowres_size,
-            mode='trilinear',
-            align_corners=False
-        )  # Shape: (1, 1, D₂, H₂, W₂)
-        lowres_guide = F.interpolate(
-            lowres_guide,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        )  # Shape: (1, 1, D₂, H₂, W₂)
 
         # Remove the batch dimension
         image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
-        lowres_guide = lowres_guide.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
-
         age = torch.tensor([self.norm_ages[index]], dtype=torch.float16) # Shape: [1]
         # gender = torch.tensor(self.gender_encoded[index], dtype=torch.float16)  # Shape: [2]
         # bvv = torch.tensor([self.normalized_bvvs[index]], dtype=torch.float16)  # Shape: [1]
-
-        #cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
+        # cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
 
         sample = {
             "pixel_values": image,
             "condition": age,
-            "lowres_guide": lowres_guide,
         }
 
         if self.transform:
@@ -840,7 +622,6 @@ class UKB_Dataset(Dataset):
 
         patch_position_sampled = random.randint(0, 26)
         sample["pixel_values"] = self.get_patch_by_index(sample["pixel_values"], patch_position_sampled, self.mapping)
-        sample["lowres_guide"] = self.get_patch_by_index(sample["lowres_guide"], patch_position_sampled, self.mapping)
         sample["patch_position"] = torch.tensor(patch_position_sampled, dtype=torch.long)
 
         return sample
@@ -857,15 +638,6 @@ def main():
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
 
-    # if args.non_ema_revision is not None:
-    #     deprecate(
-    #         "non_ema_revision!=None",
-    #         "0.15.0",
-    #         message=(
-    #             "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
-    #             " use `--variant=non_ema` instead."
-    #         ),
-    #     )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -908,10 +680,6 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-        # if args.push_to_hub:
-        #     repo_id = create_repo(
-        #         repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-        #     ).repo_id
 
     # Load VAE & Unet3D
     vae = VQGAN.from_pretrained( ### set to pretrained VQGAN model path
@@ -929,7 +697,6 @@ def main():
         attn_dim_head=int(args.attn_heads*2), # 48
         num_patch_positions=27, ###
         patch_position_embedding_dim=16, ###
-        low_res_guidance_channel=None, ###
     ).to(accelerator.device)
 
     # Create EMA for the unet.
@@ -943,7 +710,6 @@ def main():
             attn_dim_head=int(args.attn_heads*2), # 48
             num_patch_positions=27, ###
             patch_position_embedding_dim=16, ###
-            low_res_guidance_channel=None, ###
         )
         ema_unet3d = EMAModel(
             ema_unet3d.parameters(), 
@@ -1066,8 +832,6 @@ def main():
     train_transforms = transforms.Compose(
         [
             transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
-            #transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
-            #transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
@@ -1306,7 +1070,6 @@ def main():
                     z_pred = unet3d(x=noisy_latents, 
                                     time=timesteps, 
                                     patch_position=batch["patch_position"], 
-                                    low_res_guidance=None, ###
                                     cond=cond, 
                                     null_cond_prob=0.1)
 
@@ -1444,7 +1207,6 @@ def main():
                                 z_pred = unet3d(x=noisy_latents, 
                                                 time=timesteps, 
                                                 patch_position=batch["patch_position"], 
-                                                low_res_guidance=None, ###
                                                 cond=cond)
 
                                 if args.loss_type == 'l1':

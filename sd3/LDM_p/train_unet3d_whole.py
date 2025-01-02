@@ -185,8 +185,8 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
                                         num_frames=int(input_size[0] / vae.config.downsample[0]),
                                         channels=int(vae.config.embedding_dim),
                                         patch_position=patch_position[i].unsqueeze(0), ###
-                                        low_res_guidance=None, ###
-                                        cond=cond[i].unsqueeze(0), #####
+                                        low_res_guidance=low_res_guidance[i].unsqueeze(0), ###
+                                        cond=cond[i].unsqueeze(0), ###
                                         cond_scale=1., ###
                                         batch_size=1
                                         )
@@ -766,6 +766,56 @@ class UKB_Dataset(Dataset):
         ]
         return patch
 
+    def gaussian_kernel_3d(self, kernel_size=5, sigma=2.0, device='cpu'):
+        """
+        Create a 3D Gaussian kernel for convolution.
+        kernel_size: int (odd number), size of the kernel for D,H,W.
+        sigma: float, standard deviation for Gaussian.
+        """
+        coords = torch.arange(kernel_size, dtype=torch.float32, device=device)
+        coords = coords - (kernel_size - 1) / 2
+        g = torch.exp(-(coords**2) / (2 * sigma**2))
+        g = g / g.sum()
+        
+        # g is 1D, make it 3D by outer products
+        g_3d = g[:, None, None] * g[None, :, None] * g[None, None, :]
+        g_3d = g_3d / g_3d.sum()
+        
+        # Shape (1,1,D,H,W)
+        g_3d = g_3d.unsqueeze(0).unsqueeze(0)
+        return g_3d
+
+    def gaussian_blur_3d(self, volume, kernel_size=5, sigma=2.0):
+        """
+        Apply 3D Gaussian blur to a volume of shape (1, D, H, W).
+        
+        Args:
+            volume (torch.Tensor): shape (1, D, H, W), single-channel volume.
+            kernel_size (int): Kernel size for Gaussian.
+            sigma (float): Standard deviation for Gaussian.
+            
+        Returns:
+            torch.Tensor: Blurred volume of shape (1, D, H, W).
+        """
+        device = volume.device
+        C = volume.shape[0]
+        assert C == 1, "This function assumes a single channel (C=1)."
+        assert volume.ndim == 4, "Volume should have shape (1, D, H, W)."
+        
+        kernel = self.gaussian_kernel_3d(kernel_size, sigma, device=device)  # (1,1,D,H,W)
+        
+        # Add a batch dimension: (1, C=1, D, H, W)
+        volume = volume.unsqueeze(0)  # shape now (1,1,D,H,W)
+        
+        # Perform convolution with padding to maintain shape
+        padding = kernel_size // 2
+        blurred = F.conv3d(volume, kernel, padding=padding, groups=1)
+        # blurred shape is still (1,1,D,H,W)
+        
+        # Remove batch dimension
+        blurred = blurred.squeeze(0)  # back to (1, D, H, W)
+        return blurred
+
     def __len__(self):
         return len(self.image_names)
 
@@ -811,12 +861,12 @@ class UKB_Dataset(Dataset):
             mode='trilinear',
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
-        lowres_guide = F.interpolate(
-            lowres_guide,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        )  # Shape: (1, 1, D₂, H₂, W₂)
+        # lowres_guide = F.interpolate(
+        #     lowres_guide,
+        #     size=target_size,
+        #     mode='trilinear',
+        #     align_corners=False
+        # )  # Shape: (1, 1, D₂, H₂, W₂)
 
         # Remove the batch dimension
         image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
@@ -840,7 +890,8 @@ class UKB_Dataset(Dataset):
 
         patch_position_sampled = random.randint(0, 26)
         sample["pixel_values"] = self.get_patch_by_index(sample["pixel_values"], patch_position_sampled, self.mapping)
-        sample["lowres_guide"] = self.get_patch_by_index(sample["lowres_guide"], patch_position_sampled, self.mapping)
+        #sample["lowres_guide"] = self.get_patch_by_index(sample["lowres_guide"], patch_position_sampled, self.mapping)
+        #sample["lowres_guide"] = self.gaussian_blur_3d(sample["lowres_guide"])
         sample["patch_position"] = torch.tensor(patch_position_sampled, dtype=torch.long)
 
         return sample
@@ -929,7 +980,9 @@ def main():
         attn_dim_head=int(args.attn_heads*2), # 48
         num_patch_positions=27, ###
         patch_position_embedding_dim=16, ###
-        low_res_guidance_channel=None, ###
+        low_res_guidance_channel=1, ###
+        guidance_dim=256, ###
+        #guidance_embedding_dim=128, ###
     ).to(accelerator.device)
 
     # Create EMA for the unet.
@@ -943,7 +996,9 @@ def main():
             attn_dim_head=int(args.attn_heads*2), # 48
             num_patch_positions=27, ###
             patch_position_embedding_dim=16, ###
-            low_res_guidance_channel=None, ###
+            low_res_guidance_channel=1, ###
+            guidance_dim=256, ###
+            #guidance_embedding_dim=128, ###
         )
         ema_unet3d = EMAModel(
             ema_unet3d.parameters(), 
@@ -1066,11 +1121,13 @@ def main():
     train_transforms = transforms.Compose(
         [
             transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
-            #transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
-            #transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
+            transforms.ScaleIntensityd(keys=["lowres_guide"], minv=-1.0, maxv=1.0),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=1, above=False, cval=1.0),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=-1, above=True, cval=-1.0),
+            transforms.ToTensord(keys=["lowres_guide"]),
         ]
     )
 
@@ -1306,7 +1363,7 @@ def main():
                     z_pred = unet3d(x=noisy_latents, 
                                     time=timesteps, 
                                     patch_position=batch["patch_position"], 
-                                    low_res_guidance=None, ###
+                                    low_res_guidance=batch["lowres_guide"],
                                     cond=cond, 
                                     null_cond_prob=0.1)
 
@@ -1444,7 +1501,7 @@ def main():
                                 z_pred = unet3d(x=noisy_latents, 
                                                 time=timesteps, 
                                                 patch_position=batch["patch_position"], 
-                                                low_res_guidance=None, ###
+                                                low_res_guidance=batch["lowres_guide"],
                                                 cond=cond)
 
                                 if args.loss_type == 'l1':

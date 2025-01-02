@@ -1,6 +1,6 @@
 import os
+import numpy as np
 from PIL import Image
-
 import torch
 import matplotlib.pyplot as plt
 
@@ -204,6 +204,8 @@ def save_slices_as_images(volume_data):
     return slice_images
 
 
+
+# mapping
 depth_starts = [0, 71, 142]
 height_starts = [0, 59, 118]
 width_starts = [0, 59, 118]
@@ -223,14 +225,9 @@ for start_d in depth_starts:
 
 
 
-# Concat
-import os
-import numpy as np
-
-original = os.listdir("/shared/s1/lab06/20252_individual_samples/")[:250]
-
-dir_idx = os.listdir("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/noguide_500/")
-dir_idx_name = sorted(list(set([int(name.split("_")[2]) for name in dir_idx])))[:250]
+# encoder
+dir_idx = os.listdir("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E3_Gens_encoder/")
+dir_idx_name = sorted(list(set([int(name.split("_")[3]) for name in dir_idx])))[:250]
 len(dir_idx_name)
 
 patch_size = (76, 64, 64)
@@ -238,18 +235,18 @@ volume_shape = (1, 218, 182, 182)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 volume_depth = volume_shape[1]  # Total depth of the volume
 
-concat_numpy = []
+numpy = []
 for name in dir_idx_name:
     print(f"{name} processing")
-    concat_patches = []
+    patches = []
     for idx in range(27):
         # Generate or load the patch corresponding to index idx
         # For example, use your model to generate the patch
-        concat_patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/noguide_500/noguide_patch_{name}_{idx}_gen1_tensor.pth").squeeze(0)
-        concat_patches.append(concat_patch)
+        patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E3_Gens_encoder/E3_encoder_patch_{name}_{idx}_gen1.pth").squeeze(0)
+        patches.append(patch)
         
     # Collect slice means
-    slice_means = collect_slice_means(concat_patches, mapping, volume_depth)
+    slice_means = collect_slice_means(patches, mapping, volume_depth)
 
     # Compute global slice means
     global_slice_means = compute_global_slice_means(slice_means)
@@ -258,112 +255,75 @@ for name in dir_idx_name:
     smoothed_global_slice_means = smooth_global_slice_means(global_slice_means, kernel_size=5, sigma=2.0)
 
     # Adjust patches using smoothed global slice means
-    adjusted_patches = adjust_patches_global_slice_means(concat_patches, mapping, smoothed_global_slice_means)
+    adjusted_patches = adjust_patches_global_slice_means(patches, mapping, smoothed_global_slice_means)
 
     # Proceed to merge the adjusted patches as before
     merged_volume = merge_patches_weighted(adjusted_patches, mapping, volume_shape, patch_size, device=device)
+    #merged_volume = merge_patches(patches, mapping, volume_shape)
     #print(merged_volume.shape)
     array = merged_volume.cpu().numpy()
-    np.save(f'/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/noguide_numpy/noguide_{name}.npy', array)
-    
-    #concat_numpy.append(array)
-    #concat_merged_volume = merge_patches(concat_patches, mapping, volume_shape)
+    np.save(f'/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_Gens_encoder/E3_encoder_whole_{name}_smooth.npy', array)
+    break # test for single image
+
+temp_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/encoder_tmp_slices"
+os.makedirs(temp_dir, exist_ok=True)
+
+encoder = save_slices_as_images(merged_volume.cpu().squeeze().numpy()) # encoder_merged_volume
+encoder[0].save(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_encoder_whole_{dir_idx_name[-1]}_smooth.gif", 
+                save_all=True, append_images=encoder[1:], duration=200, loop=0)
+
+for img_file in os.listdir(temp_dir):
+    os.remove(os.path.join(temp_dir, img_file))
+os.rmdir(temp_dir)
 
 
 
+# noguide
+dir_idx = os.listdir("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E3_Gens_noguide/")
+dir_idx_name = sorted(list(set([int(name.split("_")[2]) for name in dir_idx])))[:250]
+len(dir_idx_name)
 
-# temp_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/concat_tmp_slices"
-# os.makedirs(temp_dir, exist_ok=True)
+patch_size = (76, 64, 64)
+volume_shape = (1, 218, 182, 182)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+volume_depth = volume_shape[1]  # Total depth of the volume
 
-# concat = save_slices_as_images(merged_volume.cpu().squeeze().numpy()) # concat_merged_volume
-# concat[0].save("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/concat_whole_0_gen_temp_smooth.gif", save_all=True, append_images=concat[1:], duration=200, loop=0)
+numpy = []
+for name in dir_idx_name:
+    print(f"{name} processing")
+    patches = []
+    for idx in range(27):
+        # Generate or load the patch corresponding to index idx
+        # For example, use your model to generate the patch
+        patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E3_Gens_noguide/E3_noguide_patch_{name}_{idx}_gen1.pth").squeeze(0)
+        patches.append(patch)
+        
+    # Collect slice means
+    slice_means = collect_slice_means(patches, mapping, volume_depth)
 
-# for img_file in os.listdir(temp_dir):
-#     os.remove(os.path.join(temp_dir, img_file))
-# os.rmdir(temp_dir)
+    # Compute global slice means
+    global_slice_means = compute_global_slice_means(slice_means)
 
+    # Optionally smooth the global slice means
+    smoothed_global_slice_means = smooth_global_slice_means(global_slice_means, kernel_size=5, sigma=2.0)
 
+    # Adjust patches using smoothed global slice means
+    adjusted_patches = adjust_patches_global_slice_means(patches, mapping, smoothed_global_slice_means)
 
+    # Proceed to merge the adjusted patches as before
+    merged_volume = merge_patches_weighted(adjusted_patches, mapping, volume_shape, patch_size, device=device)
+    #merged_volume = merge_patches(patches, mapping, volume_shape)
+    #print(merged_volume.shape)
+    array = merged_volume.cpu().numpy()
+    np.save(f'/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_Gens_noguide/E3_noguide_whole_{name}_smooth.npy', array)
 
-# # noguide
-# noguide_patches = []
+temp_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/noguide_tmp_slices"
+os.makedirs(temp_dir, exist_ok=True)
 
-# for idx in range(27):
-#     # Generate or load the patch corresponding to index idx
-#     # For example, use your model to generate the patch
-#     noguide_patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/noguide_500/noguide_patch_0_{idx}_gen1_tensor.pth").squeeze(0)
-#     noguide_patches.append(noguide_patch)
+noguide = save_slices_as_images(merged_volume.cpu().squeeze().numpy()) # noguide_merged_volume
+noguide[0].save(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_noguide_whole_{dir_idx_name[-1]}_smooth.gif", 
+                save_all=True, append_images=noguide[1:], duration=200, loop=0)
 
-# patch_size = (76, 64, 64)
-# volume_shape = (1, 218, 182, 182)
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
-# volume_depth = volume_shape[1]  # Total depth of the volume
-
-# # Collect slice means
-# slice_means = collect_slice_means(noguide_patches, mapping, volume_depth)
-
-# # Compute global slice means
-# global_slice_means = compute_global_slice_means(slice_means)
-
-# # Optionally smooth the global slice means
-# smoothed_global_slice_means = smooth_global_slice_means(global_slice_means, kernel_size=5, sigma=2.0)
-
-# # Adjust patches using smoothed global slice means
-# adjusted_patches = adjust_patches_global_slice_means(noguide_patches, mapping, smoothed_global_slice_means)
-
-# # Proceed to merge the adjusted patches as before
-# merged_volume = merge_patches_weighted(adjusted_patches, mapping, volume_shape, patch_size, device=device)
-
-# noguide_merged_volume = merge_patches(noguide_patches, mapping, volume_shape)
-
-# temp_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/noguide_tmp_slices"
-# os.makedirs(temp_dir, exist_ok=True)
-
-# noguide = save_slices_as_images(merged_volume.cpu().squeeze().numpy())
-# noguide[0].save("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/noguide_whole_0_gen_temp_smooth.gif", save_all=True, append_images=noguide[1:], duration=200, loop=0)
-
-# for img_file in os.listdir(temp_dir):
-#     os.remove(os.path.join(temp_dir, img_file))
-# os.rmdir(temp_dir)
-
-
-# # encoder
-# encoder_patches = []
-
-# for idx in range(27):
-#     # Generate or load the patch corresponding to index idx
-#     # For example, use your model to generate the patch
-#     encoder_patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/test/encoder_patch_{idx}_gen1_tensor.pth").squeeze(0)
-#     encoder_patches.append(encoder_patch)
-
-# patch_size = (76, 64, 64)
-# volume_shape = (1, 218, 182, 182)
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
-# volume_depth = volume_shape[1]  # Total depth of the volume
-
-# # Collect slice means
-# slice_means = collect_slice_means(encoder_patches, mapping, volume_depth)
-
-# # Compute global slice means
-# global_slice_means = compute_global_slice_means(slice_means)
-
-# # Optionally smooth the global slice means
-# smoothed_global_slice_means = smooth_global_slice_means(global_slice_means, kernel_size=5, sigma=2.0)
-
-# # Adjust patches using smoothed global slice means
-# adjusted_patches = adjust_patches_global_slice_means(encoder_patches, mapping, smoothed_global_slice_means)
-
-# # Proceed to merge the adjusted patches as before
-# merged_volume = merge_patches_weighted(adjusted_patches, mapping, volume_shape, patch_size, device=device)
-
-# encoder_merged_volume = merge_patches(encoder_patches, mapping, volume_shape)
-
-# temp_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/encoder_tmp_slices"
-# os.makedirs(temp_dir, exist_ok=True)
-
-# encoder = save_slices_as_images(merged_volume.cpu().squeeze().numpy())
-# encoder[0].save("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/encoder_whole_0_gen_temp_smooth.gif", save_all=True, append_images=encoder[1:], duration=200, loop=0)
-
-# for img_file in os.listdir(temp_dir):
-#     os.remove(os.path.join(temp_dir, img_file))
-# os.rmdir(temp_dir)
+for img_file in os.listdir(temp_dir):
+    os.remove(os.path.join(temp_dir, img_file))
+os.rmdir(temp_dir)

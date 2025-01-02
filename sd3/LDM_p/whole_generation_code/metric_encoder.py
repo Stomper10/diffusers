@@ -17,8 +17,8 @@ train_transforms = transforms.Compose(
     )
 
 def volume_pairs_generator(original_dir, generated_dir):
-    original_files = sorted(os.listdir(original_dir))[:250]
-    generated_files = sorted(os.listdir(generated_dir))[250:500]
+    original_files = sorted(os.listdir(original_dir))[:100]
+    generated_files = sorted(os.listdir(generated_dir))
 
     i = 0
     for orig_file, gen_file in zip(original_files, generated_files):
@@ -53,40 +53,18 @@ def volume_pairs_generator(original_dir, generated_dir):
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
         sample = dict()
-        sample["pixel_values"] = image
+        sample["pixel_values"] = image.to(torch.float16)
         sample = train_transforms(sample)
         original_volume = np.array(sample["pixel_values"].squeeze(0))
         
-        generated_volume = np.load(gen_path) # (128,128,128,1)
-        image = torch.from_numpy(generated_volume)
-        axes_mapping = {
-            's': (3, 0, 1, 2),
-            'c': (3, 1, 0, 2),
-            'a': (3, 2, 1, 0)
-        }
-
-        try:
-            image = image.permute(*axes_mapping['c'])  # (1,128,128,128)
-        except KeyError:
-            raise ValueError("axis must be one of 'a', 'c', or 's'.")
+        # generated 250 samples
+        # generated_volume = torch.from_numpy(np.load(gen_path)) # (1,218,182,182)
+        # gen = dict()
+        # gen["pixel_values"] = generated_volume.unsqueeze(0).to(torch.float16)
+        # gen = train_transforms(gen)
+        # generated_volume = np.array(gen["pixel_values"].squeeze(0))
+        generated_volume = np.load(gen_path) # (1,218,182,182)
         
-        # Add batch dimension (N=1) for interpolation
-        image = image.unsqueeze(0)  # Shape: (1, 1, D, H, W)
-
-        # Define target size
-        target_size = (218, 182, 182)  # (D₂, H₂, W₂)
-
-        # Resize the volume using trilinear interpolation
-        image = F.interpolate(
-            image,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        )  # Shape: (1, 1, D₂, H₂, W₂)
-        sample = dict()
-        sample["pixel_values"] = image
-        sample = train_transforms(sample)
-        generated_volume = np.array(sample["pixel_values"].squeeze(0))
         i += 1
 
         yield original_volume, generated_volume, orig_file  # Include filename for identification
@@ -175,7 +153,7 @@ def compute_ncc(original, generated):
 
 
 
-
+# combined
 def compute_metrics_for_volumes(original_dir, generated_dir):
     for original_volume, generated_volume, volume_name in volume_pairs_generator(original_dir, generated_dir):
         # Ensure volumes have the same shape
@@ -210,8 +188,10 @@ def compute_metrics_for_volumes(original_dir, generated_dir):
     }
 
 
+
+# Run
 original_dir = "/shared/s1/lab06/20252_individual_samples/"
-generated_dir = "/shared/s1/lab06/20252_individual_samples/"
+generated_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_Gens_encoder"
 
 mse_values = []
 rmse_values = []

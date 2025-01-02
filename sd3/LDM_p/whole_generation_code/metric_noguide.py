@@ -17,7 +17,7 @@ train_transforms = transforms.Compose(
     )
 
 def volume_pairs_generator(original_dir, generated_dir):
-    original_files = sorted(os.listdir(original_dir))[:250]
+    original_files = sorted(os.listdir(original_dir))[:100]
     generated_files = sorted(os.listdir(generated_dir))
 
     i = 0
@@ -53,11 +53,18 @@ def volume_pairs_generator(original_dir, generated_dir):
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
         sample = dict()
-        sample["pixel_values"] = image
+        sample["pixel_values"] = image.to(torch.float16)
         sample = train_transforms(sample)
-
         original_volume = np.array(sample["pixel_values"].squeeze(0))
+        
+        # generated 250 samples
+        # generated_volume = torch.from_numpy(np.load(gen_path)) # (1,218,182,182)
+        # gen = dict()
+        # gen["pixel_values"] = generated_volume.unsqueeze(0).to(torch.float16)
+        # gen = train_transforms(gen)
+        # generated_volume = np.array(gen["pixel_values"].squeeze(0))
         generated_volume = np.load(gen_path) # (1,218,182,182)
+        
         i += 1
 
         yield original_volume, generated_volume, orig_file  # Include filename for identification
@@ -146,7 +153,7 @@ def compute_ncc(original, generated):
 
 
 
-
+# combined
 def compute_metrics_for_volumes(original_dir, generated_dir):
     for original_volume, generated_volume, volume_name in volume_pairs_generator(original_dir, generated_dir):
         # Ensure volumes have the same shape
@@ -181,8 +188,10 @@ def compute_metrics_for_volumes(original_dir, generated_dir):
     }
 
 
+
+# Run
 original_dir = "/shared/s1/lab06/20252_individual_samples/"
-generated_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/noguide_numpy"
+generated_dir = "/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/whole_generation/E3_Gens_noguide"
 
 mse_values = []
 rmse_values = []
