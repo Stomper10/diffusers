@@ -30,6 +30,9 @@ from ...configuration_utils import ConfigMixin, register_to_config
 from ..modeling_utils import ModelMixin
 from typing import Tuple , Optional, Union
 
+
+#from ...utils.accelerate_utils import apply_forward_hook
+import numpy as np
 # helpers functions
 
 
@@ -1329,7 +1332,9 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         null_cond_prob=0.,
         focus_present_mask=None,
         # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
-        prob_focus_present=0.
+        prob_focus_present=0.,
+        down_block_additional_residuals=None, #####
+        mid_block_additional_residual=None #####
     ):
         assert not (self.has_cond and not exists(cond)
                     ), 'cond must be passed in if cond_dim specified'
@@ -1365,16 +1370,33 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         # Concatenate all conditioning embeddings
         t = torch.cat([emb for emb in cond_emb_list if emb is not None], dim=-1)
 
-        h = []
+        h = [x] ###
+        j = [] ###
 
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
+            h.append(x)
             x = block2(x, t)
+            h.append(x)
             x = spatial_attn(x)
+            h.append(x)
             x = temporal_attn(x, pos_bias=time_rel_pos_bias,
                               focus_present_mask=focus_present_mask)
             h.append(x)
+            j.append(x)
             x = downsample(x)
+            h.append(x)
+
+        # Additional residual conections for Controlnets
+        if down_block_additional_residuals is not None:
+            new_down_block_res_samples = ()
+            for down_block_res_sample, down_block_additional_residual in zip(
+                h, down_block_additional_residuals
+            ):
+                down_block_res_sample = down_block_res_sample + down_block_additional_residual
+                new_down_block_res_samples += (down_block_res_sample,)
+
+            h = new_down_block_res_samples
 
         x = self.mid_block1(x, t)
         x = self.mid_spatial_attn(x)
@@ -1382,8 +1404,12 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
             x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
         x = self.mid_block2(x, t)
 
+        # Additional residual conections for Controlnets
+        if mid_block_additional_residual is not None:
+            x = x + mid_block_additional_residual
+
         for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim=1)
+            x = torch.cat((x, j.pop()), dim=1) ###
             x = block1(x, t)
             x = block2(x, t)
             x = spatial_attn(x)
@@ -1504,9 +1530,15 @@ class PatchGaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, unet, x, t, clip_denoised: bool, patch_position, cond=None, cond_scale=1.): ###
+    def p_mean_variance(self, unet, x, t, clip_denoised: bool, patch_position, cond=None, down_block_additional_residuals=None, mid_block_additional_residual=None, cond_scale=1.): ###
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=unet.forward_with_cond_scale(x, t, patch_position, cond=cond, cond_scale=cond_scale)) ###
+            x, t=t, noise=unet.forward_with_cond_scale(x, 
+                                                       t, 
+                                                       patch_position, 
+                                                       cond=cond, 
+                                                       down_block_additional_residuals=down_block_additional_residuals,
+                                                       mid_block_additional_residual=mid_block_additional_residual,
+                                                       cond_scale=cond_scale)) ###
 
         if clip_denoised:
             s = 1.
@@ -1528,10 +1560,18 @@ class PatchGaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, unet, x, t, patch_position, cond=None, cond_scale=1., clip_denoised=True): ###
+    def p_sample(self, unet, x, t, patch_position, cond=None, down_block_additional_residuals=None, mid_block_additional_residual=None, cond_scale=1., clip_denoised=True): ###
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            unet, x=x, t=t, clip_denoised=clip_denoised, patch_position=patch_position, cond=cond, cond_scale=cond_scale) ###
+            unet, 
+            x=x, 
+            t=t, 
+            clip_denoised=clip_denoised, 
+            patch_position=patch_position, 
+            cond=cond,
+            down_block_additional_residuals=down_block_additional_residuals, 
+            mid_block_additional_residual=mid_block_additional_residual, 
+            cond_scale=cond_scale) ###
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -1539,20 +1579,35 @@ class PatchGaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, unet, shape, patch_position, cond=None, cond_scale=1.): ###
+    def p_sample_loop(self, unet, controlnet, shape, patch_position, cond=None, low_res_guidance=None, cond_scale=1.): ###
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-            img = self.p_sample(unet, img, torch.full( ###
-                (b,), i, device=device, dtype=torch.long), patch_position, cond=cond, cond_scale=cond_scale)
+            down_block_res_samples, mid_block_res_sample = controlnet( #####
+                                    x=img,
+                                    time=torch.full((b,), i, device=device, dtype=torch.long), 
+                                    controlnet_cond=low_res_guidance, 
+                                    conditioning_scale=1.0,
+                                    patch_position=patch_position,
+                                    cond=cond
+                                )
+            
+            img = self.p_sample(unet, 
+                                img, 
+                                torch.full((b,), i, device=device, dtype=torch.long), 
+                                patch_position, 
+                                cond=cond, 
+                                down_block_additional_residuals=down_block_res_samples, 
+                                mid_block_additional_residual=mid_block_res_sample, 
+                                cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
-    def sample(self, vae, unet, image_size, num_frames, channels, patch_position, cond=None, cond_scale=1., batch_size=16): ###
+    def sample(self, vae, unet, controlnet, image_size, num_frames, channels, patch_position, cond=None, low_res_guidance=None, cond_scale=1., batch_size=16): ###
         device = next(unet.parameters()).device
 
         if is_list_str(cond):
@@ -1563,7 +1618,13 @@ class PatchGaussianDiffusion(nn.Module):
         # channels = self.channels
         # num_frames = self.num_frames
         _sample = self.p_sample_loop(
-            unet, (batch_size, channels, num_frames, image_size, image_size), patch_position, cond=cond, cond_scale=cond_scale) ###
+            unet, 
+            controlnet,
+            (batch_size, channels, num_frames, image_size, image_size), 
+            patch_position, 
+            cond=cond, 
+            low_res_guidance=low_res_guidance,
+            cond_scale=cond_scale) ###
 
         if isinstance(vae, VQGAN):
             # denormalize TODO: Remove eventually
@@ -1600,4 +1661,514 @@ class PatchGaussianDiffusion(nn.Module):
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod,
                     t, x_start.shape) * noise
+        )
+    
+
+#######
+
+class PatchControlNet(ModelMixin, ConfigMixin):
+
+    @register_to_config
+    def __init__(
+        self,
+        dim: int = 32,
+        cond_dim=None,
+        out_dim=None,
+        dim_mults: Tuple[int, ...] = (1, 2, 4, 8),
+        channels: int = 3,
+        attn_heads: int = 8,
+        attn_dim_head: int = 32,
+        use_bert_text_cond=False,
+        init_dim=None,
+        init_kernel_size: int = 7,
+        use_sparse_linear_attn=True,
+        block_type: str = 'resnet',
+        resnet_groups: int = 8,
+        num_patch_positions: int = 27, ###
+        patch_position_embedding_dim: int = 16, ###
+    ):
+        super().__init__()
+
+        # temporal attention and its relative positional encoding
+        rotary_emb = RotaryEmbedding(min(32, attn_dim_head))
+
+        def temporal_attn(dim): return EinopsToAndFrom('b c f h w', 'b (h w) f c', Attention(
+            dim, heads=attn_heads, dim_head=attn_dim_head, rotary_emb=copy.deepcopy(rotary_emb))) ###
+
+        # realistically will not be able to generate that many frames of video... yet
+        self.time_rel_pos_bias = RelativePositionBias(
+            heads=attn_heads, max_distance=32)
+
+        # initial conv
+        init_dim = default(init_dim, dim)
+        assert is_odd(init_kernel_size)
+
+        init_padding = init_kernel_size // 2
+
+        self.init_conv = nn.Conv3d(channels, init_dim, (1, init_kernel_size, ###
+                                   init_kernel_size), padding=(0, init_padding, init_padding))
+
+        self.init_temporal_attn = Residual(
+            PreNorm(init_dim, temporal_attn(init_dim)))
+
+        # dimensions
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        # Embedding layer for patch positions
+        self.patch_position_embedding = nn.Embedding(
+            num_embeddings=num_patch_positions,
+            embedding_dim=patch_position_embedding_dim
+        )
+
+        # time conditioning
+        time_dim = dim * 4
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(dim),
+            nn.Linear(dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        # text conditioning
+        self.has_cond = exists(cond_dim) or use_bert_text_cond
+        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
+
+        self.null_cond_emb = nn.Parameter(
+            torch.randn(1, cond_dim)) if self.has_cond else None
+
+        cond_dim = time_dim + int(cond_dim or 0) + patch_position_embedding_dim
+
+        # control net conditioning embedding ###
+        self.controlnet_cond_embedding = ControlNetConditioningEmbedding_VQGANEncoder(
+            # embedding_dim=8,
+            # n_codes=16384,
+            n_hiddens=16,
+            downsample=(2,2,2),
+            image_channels=1,
+            # restart_thres=1.0,
+            # no_random_restart=False,
+            norm_type="group",
+            padding_type="replicate",
+            num_groups=32,
+        )
+
+        # layers
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+
+        self.controlnet_down_blocks = nn.ModuleList([]) ###
+
+        num_resolutions = len(in_out)
+
+        # block type
+        block_klass = partial(ResnetBlock, groups=resnet_groups)
+        block_klass_cond = partial(block_klass, time_emb_dim=cond_dim)
+
+        ###
+        controlnet_block = nn.Conv3d(in_out[0][0], in_out[0][0], kernel_size=1)
+        controlnet_block = zero_module(controlnet_block)
+        self.controlnet_down_blocks.append(controlnet_block)
+        ###
+
+        # modules for all layers
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                block_klass_cond(dim_in, dim_out),
+                block_klass_cond(dim_out, dim_out),
+                Residual(PreNorm(dim_out, SpatialLinearAttention(
+                    dim_out, heads=attn_heads))) if use_sparse_linear_attn else nn.Identity(),
+                Residual(PreNorm(dim_out, temporal_attn(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+            ###
+            for _ in range(4):
+                controlnet_block = nn.Conv3d(dim_out, dim_out, kernel_size=1)
+                controlnet_block = zero_module(controlnet_block)
+                self.controlnet_down_blocks.append(controlnet_block)
+
+            if not is_last:
+                controlnet_block = nn.Conv3d(dim_out, dim_out, kernel_size=1)
+                controlnet_block = zero_module(controlnet_block)
+                self.controlnet_down_blocks.append(controlnet_block)
+            ###
+        
+        mid_dim = dims[-1]
+        self.mid_block1 = block_klass_cond(mid_dim, mid_dim)
+
+        spatial_attn = EinopsToAndFrom(
+            'b c f h w', 'b f (h w) c', Attention(mid_dim, heads=attn_heads))
+
+        self.mid_spatial_attn = Residual(PreNorm(mid_dim, spatial_attn))
+        self.mid_temporal_attn = Residual(
+            PreNorm(mid_dim, temporal_attn(mid_dim)))
+
+        self.mid_block2 = block_klass_cond(mid_dim, mid_dim)
+
+        ###
+        # self.controlnet_mid_block = nn.ModuleList([]) ###
+        # for _ in range(4):
+        controlnet_block = nn.Conv3d(mid_dim, mid_dim, kernel_size=1)
+        controlnet_block = zero_module(controlnet_block)
+        self.controlnet_mid_block = controlnet_block
+        ###
+
+    def forward_with_cond_scale(
+        self,
+        *args,
+        cond_scale=2.,
+        **kwargs
+    ):
+        logits = self.forward(*args, null_cond_prob=0., **kwargs)
+        if cond_scale == 1 or not self.has_cond:
+            return logits
+
+        null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
+        return null_logits + (logits - null_logits) * cond_scale
+
+    def forward(
+        self,
+        x,
+        time,
+        controlnet_cond, ###
+        conditioning_scale, ###
+        patch_position,
+        cond=None,
+        null_cond_prob=0.,
+        focus_present_mask=None,
+        # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
+        prob_focus_present=0.
+    ):
+        assert not (self.has_cond and not exists(cond)
+                    ), 'cond must be passed in if cond_dim specified'
+        batch, device = x.shape[0], x.device
+
+        focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
+            (batch,), prob_focus_present, device=device))
+
+        time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
+
+        x = self.init_conv(x)
+        r = x.clone()
+
+        x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
+
+        ###
+        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
+        x += controlnet_cond
+        ###
+
+        t = self.time_mlp(time) if exists(self.time_mlp) else None
+        patch_pos_emb = self.patch_position_embedding(patch_position)
+        # print("### t.shape:", t.shape)
+        # print("### patch_pos_emb.shape:", patch_pos_emb.shape)
+        # print("### cond.shape:", cond.shape)
+        # print("### guidance_emb.shape:", guidance_emb.shape)
+
+        cond_emb_list = [t, patch_pos_emb]
+        
+        # classifier free guidance
+        if self.has_cond:
+            batch, device = x.shape[0], x.device
+            mask = prob_mask_like((batch,), null_cond_prob, device=device)
+            cond = torch.where(rearrange(mask, 'b -> b 1'),
+                               self.null_cond_emb, cond)
+            cond_emb_list.append(cond)
+        
+        # Concatenate all conditioning embeddings
+        t = torch.cat([emb for emb in cond_emb_list if emb is not None], dim=-1)
+
+        h = [x] ###
+
+        for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
+            x = block1(x, t)
+            h.append(x)
+            x = block2(x, t)
+            h.append(x)
+            x = spatial_attn(x)
+            h.append(x)
+            x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+                              focus_present_mask=focus_present_mask)
+            h.append(x)
+            x = downsample(x)
+            h.append(x)
+        
+        x = self.mid_block1(x, t)
+        x = self.mid_spatial_attn(x)
+        x = self.mid_temporal_attn(
+            x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
+        x = self.mid_block2(x, t)
+
+        ###
+        controlnet_down_block_res_samples = ()
+
+        for down_block_res_sample, controlnet_block in zip(h, self.controlnet_down_blocks):
+            down_block_res_sample = controlnet_block(down_block_res_sample)
+            controlnet_down_block_res_samples += (down_block_res_sample,)
+
+        h = controlnet_down_block_res_samples
+
+        mid_block_res_sample = self.controlnet_mid_block(x)
+
+        h = [x * conditioning_scale for x in h]
+        mid_block_res_sample *= conditioning_scale
+
+        ###
+
+        # for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
+        #     x = torch.cat((x, h.pop()), dim=1)
+        #     x = block1(x, t)
+        #     x = block2(x, t)
+        #     x = spatial_attn(x)
+        #     x = temporal_attn(x, pos_bias=time_rel_pos_bias,
+        #                       focus_present_mask=focus_present_mask)
+        #     x = upsample(x)
+
+        # x = torch.cat((x, r), dim=1)
+        return h, mid_block_res_sample
+
+
+
+def silu(x):
+    return x*torch.sigmoid(x)
+
+class SiLU(nn.Module):
+    def __init__(self):
+        super(SiLU, self).__init__()
+
+    def forward(self, x):
+        return silu(x)
+
+def Normalize(in_channels, norm_type='group', num_groups=32):
+    assert norm_type in ['group', 'batch']
+    if norm_type == 'group':
+        # TODO Changed num_groups from 32 to 8
+        return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+    elif norm_type == 'batch':
+        return torch.nn.SyncBatchNorm(in_channels)
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.0, norm_type='group', padding_type='replicate', num_groups=32):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+        self.use_conv_shortcut = conv_shortcut
+
+        self.norm1 = Normalize(in_channels, norm_type, num_groups=num_groups)
+        self.conv1 = SamePadConv3d(
+            in_channels, out_channels, kernel_size=3, padding_type=padding_type)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.norm2 = Normalize(in_channels, norm_type, num_groups=num_groups)
+        self.conv2 = SamePadConv3d(
+            out_channels, out_channels, kernel_size=3, padding_type=padding_type)
+        if self.in_channels != self.out_channels:
+            self.conv_shortcut = SamePadConv3d(
+                in_channels, out_channels, kernel_size=3, padding_type=padding_type)
+
+    def forward(self, x):
+        h = x
+        h = self.norm1(h)
+        h = silu(h)
+        h = self.conv1(h)
+        h = self.norm2(h)
+        h = silu(h)
+        h = self.conv2(h)
+
+        if self.in_channels != self.out_channels:
+            x = self.conv_shortcut(x)
+
+        return x+h
+
+class Encoder(nn.Module):
+    def __init__(self, n_hiddens, downsample, image_channel=3, norm_type='group', padding_type='replicate', num_groups=32):
+        super().__init__()
+        n_times_downsample = np.array([int(math.log2(d)) for d in downsample])
+        self.conv_blocks = nn.ModuleList()
+        max_ds = n_times_downsample.max()
+
+        self.conv_first = SamePadConv3d(
+            image_channel, n_hiddens, kernel_size=3, padding_type=padding_type)
+
+        for i in range(max_ds):
+            block = nn.Module()
+            in_channels = n_hiddens * 2**i
+            out_channels = n_hiddens * 2**(i+1)
+            stride = tuple([2 if d > 0 else 1 for d in n_times_downsample])
+            block.down = SamePadConv3d(
+                in_channels, out_channels, 4, stride=stride, padding_type=padding_type)
+            block.res = ResBlock(
+                out_channels, out_channels, norm_type=norm_type, num_groups=num_groups)
+            self.conv_blocks.append(block)
+            n_times_downsample -= 1
+
+        self.final_block = nn.Sequential(
+            Normalize(out_channels, norm_type, num_groups=num_groups),
+            SiLU()
+        )
+
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        h = self.conv_first(x)
+        for block in self.conv_blocks:
+            h = block.down(h)
+            h = block.res(h)
+        h = self.final_block(h)
+        return h
+
+
+class ControlNetConditioningEmbedding_VQGANEncoder(ModelMixin, ConfigMixin):
+    _supports_gradient_checkpointing = True
+    
+    @register_to_config
+    def __init__(
+        self,
+        # embedding_dim: int = 256,
+        # n_codes: int = 2048,
+        n_hiddens: int = 240,
+        downsample: Tuple[int, ...] = (4, 4, 4),
+        image_channels: int = 1,
+        # restart_thres: float = 1.0,
+        # no_random_restart=False,
+        norm_type: str = "group",
+        padding_type: str = "replicate",
+        num_groups: int = 32,
+    ):
+        super().__init__()
+        # self.cfg = cfg
+        # self.embedding_dim = embedding_dim
+        # self.n_codes = n_codes
+
+        self.encoder = Encoder(n_hiddens, downsample, image_channels, norm_type, padding_type, num_groups,)
+        #self.decoder = Decoder(n_hiddens, downsample, image_channels, norm_type, num_groups)
+        #self.enc_out_ch = self.encoder.out_channels
+        #self.pre_vq_conv = SamePadConv3d(self.enc_out_ch, embedding_dim, 1, padding_type=padding_type)
+        #self.post_vq_conv = SamePadConv3d(embedding_dim, self.enc_out_ch, 1)
+
+        #self.codebook = Codebook(n_codes, embedding_dim, no_random_restart=no_random_restart, restart_thres=restart_thres)
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, Encoder):
+            module.gradient_checkpointing = value
+    
+    def forward(self, x, optimizer_idx=None, log_image=False):
+        # B, C, T, H, W = x.shape
+
+        # z = self.pre_vq_conv(self.encoder(x))
+        # vq_output = self.codebook(z)
+        # x_recon = self.decoder(self.post_vq_conv(vq_output['embeddings']))
+        z = self.encoder(x)
+        return z # x_recon, vq_output
+
+
+from collections.abc import Sequence
+from monai.networks.blocks import Convolution
+
+class ControlNetConditioningEmbedding(nn.Module):
+    """
+    Network to encode the conditioning into a latent space.
+    """
+
+    def __init__(
+        self, 
+        spatial_dims: int, 
+        in_channels: int, 
+        out_channels: int, 
+        num_channels: Sequence[int] = (16, 32, 96, 256)
+    ):
+        super().__init__()
+
+        self.conv_in = Convolution(
+            spatial_dims=spatial_dims,
+            in_channels=in_channels,
+            out_channels=num_channels[0],
+            strides=1,
+            kernel_size=3,
+            padding=1,
+            conv_only=True,
+        )
+
+        self.blocks = nn.ModuleList([])
+
+        for i in range(len(num_channels) - 1):
+            channel_in = num_channels[i]
+            channel_out = num_channels[i + 1]
+            self.blocks.append(
+                Convolution(
+                    spatial_dims=spatial_dims,
+                    in_channels=channel_in,
+                    out_channels=channel_in,
+                    strides=1,
+                    kernel_size=3,
+                    padding=1,
+                    conv_only=True,
+                )
+            )
+
+            self.blocks.append(
+                Convolution(
+                    spatial_dims=spatial_dims,
+                    in_channels=channel_in,
+                    out_channels=channel_out,
+                    strides=2,
+                    kernel_size=3,
+                    padding=1,
+                    conv_only=True,
+                )
+            )
+
+        self.conv_out = zero_module(
+            Convolution(
+                spatial_dims=spatial_dims,
+                in_channels=num_channels[-1],
+                out_channels=out_channels,
+                strides=1,
+                kernel_size=3,
+                padding=1,
+                conv_only=True,
+            )
+        )
+
+    def forward(self, conditioning):
+        embedding = self.conv_in(conditioning)
+        embedding = F.silu(embedding)
+
+        for block in self.blocks:
+            embedding = block(embedding)
+            embedding = F.silu(embedding)
+
+        embedding = self.conv_out(embedding)
+
+        return embedding
+
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
+def copy_weights_to_controlnet(controlnet: nn.Module, diffusion_model: nn.Module, verbose: bool = True) -> None:
+    """
+    Copy the state dict from the input diffusion model to the ControlNet, printing, if user requires it, the output
+    keys that have matched and those that haven't.
+
+    Args:
+        controlnet: instance of ControlNet
+        diffusion_model: instance of DiffusionModelUnet or SPADEDiffusionModelUnet
+        verbose: if True, the matched and unmatched keys will be printed.
+    """
+
+    output = controlnet.load_state_dict(diffusion_model.state_dict(), strict=False)
+    if verbose:
+        dm_keys = [p[0] for p in list(diffusion_model.named_parameters()) if p[0] not in output.unexpected_keys]
+        print(
+            f"Copied weights from {len(dm_keys)} keys of the diffusion model into the ControlNet:"
+            f"\n{'; '.join(dm_keys)}\nControlNet missing keys: {len(output.missing_keys)}:"
+            f"\n{'; '.join(output.missing_keys)}\nDiffusion model incompatible keys: {len(output.unexpected_keys)}:"
+            f"\n{'; '.join(output.unexpected_keys)}"
         )

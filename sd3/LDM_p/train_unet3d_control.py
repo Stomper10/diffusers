@@ -70,7 +70,7 @@ from diffusers.training_utils import EMAModel #,compute_snr
 #from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 
 from diffusers.models.vq_gan_3d import VQGAN #, LPIPS, NLayerDiscriminator, NLayerDiscriminator3D
-from diffusers.models.ddpm import PatchUnet3D, PatchGaussianDiffusion
+from diffusers.models.ddpm import PatchUnet3D, PatchGaussianDiffusion, PatchControlNet
 from diffusers.models.ddpm.diffusion import default, is_list_str
 from diffusers.models.ddpm.text import tokenize, bert_embed #, BERT_MODEL_DIM
 #from diffusers.models.vq_gan_3d.utils import adopt_weight
@@ -83,12 +83,14 @@ check_min_version("0.28.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 @torch.no_grad()
-def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, gloabal_step, num_samples, save_dir):
+def log_validation(input_size, test_dataloader, vae, unet3d, controlnet, noise_scheduler, accelerator, weight_dtype, gloabal_step, num_samples, save_dir):
     logger.info("Running validation... ")
     vae.eval()
     unet3d.eval()
+    controlnet.eval()
     vae = accelerator.unwrap_model(vae)
     unet3d = accelerator.unwrap_model(unet3d)
+    controlnet = accelerator.unwrap_model(controlnet)
 
     os.makedirs(os.path.join(save_dir, "generated_volumes"), exist_ok=True)
 
@@ -98,15 +100,18 @@ def log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, ac
         x = batch["pixel_values"][:num_samples]
         cond = batch["condition"][:num_samples]
         patch_position = batch["patch_position"][:num_samples]
+        low_res_guidance = batch["lowres_guide"][:num_samples]
         
         for i in range(num_samples):
             image = noise_scheduler.sample(vae=vae,
                                         unet=unet3d,
+                                        controlnet=controlnet,
                                         image_size=int(input_size[1] / vae.config.downsample[1]),
                                         num_frames=int(input_size[0] / vae.config.downsample[0]),
                                         channels=int(vae.config.embedding_dim),
                                         patch_position=patch_position[i].unsqueeze(0), ###
                                         cond=cond[i].unsqueeze(0), ###
+                                        low_res_guidance=low_res_guidance[i].unsqueeze(0), ###
                                         cond_scale=1., ###
                                         batch_size=1
                                         )
@@ -260,6 +265,13 @@ def parse_args():
         default=None,
         required=True,
         help="Path to pretrained vae or vae identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_unet_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained unet3d or unet3d identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--loss_type", type=str, default="l1", help="Loss type: l1 or l2."
@@ -595,6 +607,7 @@ class UKB_Dataset(Dataset):
 
         # Define target size
         target_size = (218, 182, 182)  # (D₂, H₂, W₂)
+        lowres_size = (76, 64, 64)
 
         # Resize the volume using trilinear interpolation
         image = F.interpolate(
@@ -603,17 +616,33 @@ class UKB_Dataset(Dataset):
             mode='trilinear',
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
+        lowres_guide = F.interpolate(
+            image,
+            size=lowres_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
+        lowres_guide = F.interpolate(
+            lowres_guide,
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        )  # Shape: (1, 1, D₂, H₂, W₂)
 
         # Remove the batch dimension
         image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
+        lowres_guide = lowres_guide.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
+
         age = torch.tensor([self.norm_ages[index]], dtype=torch.float16) # Shape: [1]
         # gender = torch.tensor(self.gender_encoded[index], dtype=torch.float16)  # Shape: [2]
         # bvv = torch.tensor([self.normalized_bvvs[index]], dtype=torch.float16)  # Shape: [1]
-        # cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
+
+        #cond_tensor = torch.cat([age, gender, bvv], dim=-1)  # Shape: [4]
 
         sample = {
             "pixel_values": image,
             "condition": age,
+            "lowres_guide": lowres_guide,
         }
 
         if self.transform:
@@ -622,6 +651,13 @@ class UKB_Dataset(Dataset):
 
         patch_position_sampled = random.randint(0, 26)
         sample["pixel_values"] = self.get_patch_by_index(sample["pixel_values"], patch_position_sampled, self.mapping)
+        sample["lowres_guide"] = self.get_patch_by_index(lowres_guide, patch_position_sampled, self.mapping)
+        # sample["lowres_guide"] = F.interpolate(
+        #     sample["lowres_guide"].unsqueeze(0).to(torch.float64),
+        #     size=(38, 32, 32),
+        #     mode='trilinear',
+        #     align_corners=False
+        # ).squeeze(0).to(torch.float16)
         sample["patch_position"] = torch.tensor(patch_position_sampled, dtype=torch.long)
 
         return sample
@@ -687,37 +723,43 @@ def main():
     ).to(accelerator.device)
     vae.requires_grad_(False)
 
-    dim_mults = tuple(int(x) for x in args.dim_mults.split(","))
-    unet3d = PatchUnet3D(
-        dim=int(input_size[1] / vae.config.downsample[1]), # 32
-        cond_dim=1, # pheno dim (patch dim added internally by model)
-        dim_mults=dim_mults, # "1,2,4,8,16"
-        channels=int(vae.config.embedding_dim), # 8
-        attn_heads=args.attn_heads, # 24
-        attn_dim_head=int(args.attn_heads*2), # 48
-        num_patch_positions=27, ###
-        patch_position_embedding_dim=16, ###
+    unet3d = PatchUnet3D.from_pretrained( ### set to pretrained PatchUnet3D model path
+        args.pretrained_unet_path, subfolder="unet3d", 
     ).to(accelerator.device)
+    #unet3d.requires_grad_(False)
 
-    # Create EMA for the unet.
-    if args.use_ema:
-        ema_unet3d = PatchUnet3D(
-            dim=int(input_size[1] / vae.config.downsample[1]), # 32
-            cond_dim=1, # pheno dim (patch dim added internally by model)
-            dim_mults=dim_mults, # "1,2,4,8,16"
-            channels=int(vae.config.embedding_dim), # 8
-            attn_heads=args.attn_heads, # 24
-            attn_dim_head=int(args.attn_heads*2), # 48
-            num_patch_positions=27, ###
-            patch_position_embedding_dim=16, ###
-        )
-        ema_unet3d = EMAModel(
-            ema_unet3d.parameters(), 
-            decay=0.995,
-            update_after_step=2000,
-            model_cls=PatchUnet3D, 
-            model_config=ema_unet3d.config
-        )
+
+    # dim_mults = tuple(int(x) for x in args.dim_mults.split(","))
+    # unet3d = PatchUnet3D(
+    #     dim=int(input_size[1] / vae.config.downsample[1]), # 32
+    #     cond_dim=1, # pheno dim (patch dim added internally by model)
+    #     dim_mults=dim_mults, # "1,2,4,8,16"
+    #     channels=int(vae.config.embedding_dim), # 8
+    #     attn_heads=args.attn_heads, # 24
+    #     attn_dim_head=int(args.attn_heads*2), # 48
+    #     num_patch_positions=27, ###
+    #     patch_position_embedding_dim=16, ###
+    # ).to(accelerator.device)
+
+    # # Create EMA for the unet.
+    # if args.use_ema:
+    #     ema_unet3d = PatchUnet3D(
+    #         dim=int(input_size[1] / vae.config.downsample[1]), # 32
+    #         cond_dim=1, # pheno dim (patch dim added internally by model)
+    #         dim_mults=dim_mults, # "1,2,4,8,16"
+    #         channels=int(vae.config.embedding_dim), # 8
+    #         attn_heads=args.attn_heads, # 24
+    #         attn_dim_head=int(args.attn_heads*2), # 48
+    #         num_patch_positions=27, ###
+    #         patch_position_embedding_dim=16, ###
+    #     )
+    #     ema_unet3d = EMAModel(
+    #         ema_unet3d.parameters(), 
+    #         decay=0.995,
+    #         update_after_step=2000,
+    #         model_cls=PatchUnet3D, 
+    #         model_config=ema_unet3d.config
+    #     )
 
     noise_scheduler = PatchGaussianDiffusion( # diffusers pipeline?
         #unet3d,
@@ -737,18 +779,62 @@ def main():
     # config = OmegaConf.load(args.vqgan_config)
     # model = VQGAN(config)
 
+    ### ControlNet
+    # Create control net
+    dim_mults = tuple(int(x) for x in args.dim_mults.split(","))
+    controlnet = PatchControlNet(
+        dim=int(input_size[1] / vae.config.downsample[1]), # 32
+        cond_dim=1, # pheno dim (patch dim added internally by model)
+        dim_mults=dim_mults, # "1,2,4,8,16"
+        channels=int(vae.config.embedding_dim), # 8
+        attn_heads=args.attn_heads, # 24
+        attn_dim_head=int(args.attn_heads*2), # 48
+        num_patch_positions=27, ###
+        patch_position_embedding_dim=16, ###
+    )
+    # Create EMA for the unet.
+    if args.use_ema:
+        ema_controlnet = PatchControlNet(
+            dim=int(input_size[1] / vae.config.downsample[1]), # 32
+            cond_dim=1, # pheno dim (patch dim added internally by model)
+            dim_mults=dim_mults, # "1,2,4,8,16"
+            channels=int(vae.config.embedding_dim), # 8
+            attn_heads=args.attn_heads, # 24
+            attn_dim_head=int(args.attn_heads*2), # 48
+            num_patch_positions=27, ###
+            patch_position_embedding_dim=16, ###
+        )
+        ema_controlnet = EMAModel(
+            ema_controlnet.parameters(), 
+            decay=0.995,
+            update_after_step=2000,
+            model_cls=PatchControlNet, 
+            model_config=ema_controlnet.config
+        )
+
+    # Copy weights from the DM to the controlnet
+    controlnet.load_state_dict(unet3d.state_dict(), strict=False)
+    controlnet = controlnet.to(accelerator.device)
+    # Now, we freeze the parameters of the diffusion model.
+    unet3d.requires_grad_(False)
+    for p in unet3d.parameters():
+        p.requires_grad = False
+    #optimizer = torch.optim.Adam(params=controlnet.parameters(), lr=2.5e-5)
+    #controlnet_inferer = ControlNetDiffusionInferer(scheduler)
+    ###
+
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_unet3d.save_pretrained(os.path.join(output_dir, "unet3d_ema"))
+                    ema_controlnet.save_pretrained(os.path.join(output_dir, "controlnet_ema"))
 
                 #logger.info(f"{unet3d = }") # print model architecture
                 for _, model in enumerate(models):
-                    if isinstance(model, type(accelerator.unwrap_model(unet3d))):
-                        model.save_pretrained(os.path.join(output_dir, "unet3d"))
+                    if isinstance(model, type(accelerator.unwrap_model(controlnet))):
+                        model.save_pretrained(os.path.join(output_dir, "controlnet"))
                     else:
                         raise ValueError(f"unexpected save model: {model.__class__}")
                     
@@ -762,9 +848,9 @@ def main():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet3d_ema"), PatchUnet3D)
-                ema_unet3d.load_state_dict(load_model.state_dict())
-                ema_unet3d.to(accelerator.device)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "controlnet_ema"), PatchControlNet)
+                ema_controlnet.load_state_dict(load_model.state_dict())
+                ema_controlnet.to(accelerator.device)
                 del load_model
 
             for _ in range(len(models)):
@@ -772,8 +858,8 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                if isinstance(model, type(accelerator.unwrap_model(unet3d))):
-                    load_model = PatchUnet3D.from_pretrained(input_dir, subfolder="unet3d")
+                if isinstance(model, type(accelerator.unwrap_model(controlnet))):
+                    load_model = PatchControlNet.from_pretrained(input_dir, subfolder="controlnet")
                 else:
                     raise ValueError(f"unexpected load model: {model.__class__}")
 
@@ -826,7 +912,7 @@ def main():
     #     weight_decay=args.adam_weight_decay,
     #     eps=args.adam_epsilon,
     # )
-    optimizer = optimizer_cls(unet3d.parameters(), lr=args.learning_rate)
+    optimizer = optimizer_cls(controlnet.parameters(), lr=args.learning_rate) ###
 
     # Load data
     train_transforms = transforms.Compose(
@@ -835,6 +921,10 @@ def main():
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
             transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
             transforms.ToTensord(keys=["pixel_values"]),
+            transforms.ScaleIntensityd(keys=["lowres_guide"], minv=-1.0, maxv=1.0),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=1, above=False, cval=1.0),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=-1, above=True, cval=-1.0),
+            transforms.ToTensord(keys=["lowres_guide"]),
         ]
     )
 
@@ -881,8 +971,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet3d, optimizer, lr_scheduler, train_dataloader, test_dataloader = accelerator.prepare(
-        unet3d, optimizer, lr_scheduler, train_dataloader, test_dataloader
+    controlnet, optimizer, lr_scheduler, train_dataloader, test_dataloader = accelerator.prepare(
+        controlnet, optimizer, lr_scheduler, train_dataloader, test_dataloader
     )
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -897,8 +987,9 @@ def main():
 
     # Move vae (and ema model) to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
+    unet3d.to(accelerator.device, dtype=weight_dtype)
     if args.use_ema:
-        ema_unet3d.to(accelerator.device, dtype=weight_dtype)
+        ema_controlnet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1026,10 +1117,10 @@ def main():
         logger.info(f"{epoch = }")
         for step, batch in enumerate(train_dataloader):
             start_time = time.time()
-            unet3d.train()
+            controlnet.train()
 
             # Accumulate gradients
-            with accelerator.accumulate(unet3d):
+            with accelerator.accumulate(controlnet):
                 with torch.autocast(accelerator.device.type, dtype=weight_dtype):
                     x = batch["pixel_values"].to(weight_dtype)
                     
@@ -1040,7 +1131,7 @@ def main():
                                    (vae.codebook.embeddings.max() -
                                     vae.codebook.embeddings.min())) * 2.0 - 1.0
                     
-                    print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
+                    # print("### latents.shape:", latents.shape, flush=True) # torch.Size([10, 8, 32, 32, 32])
                     B = latents.shape[0]
                     check_shape(latents, 'b c f h w', 
                                 c=int(vae.config.embedding_dim), 
@@ -1067,11 +1158,21 @@ def main():
                         cond = bert_embed(tokenize(cond), return_cls_repr=False)
                         cond = cond.to(latents.device)
 
+                    down_block_res_samples, mid_block_res_sample = controlnet( #####
+                        x=noisy_latents, 
+                        time=timesteps, 
+                        controlnet_cond=batch["lowres_guide"], 
+                        conditioning_scale=1.0,
+                        patch_position=batch["patch_position"],
+                        cond=cond
+                    )
+
                     z_pred = unet3d(x=noisy_latents, 
                                     time=timesteps, 
                                     patch_position=batch["patch_position"], 
-                                    cond=cond, 
-                                    null_cond_prob=0.1)
+                                    cond=cond,
+                                    down_block_additional_residuals=down_block_res_samples,
+                                    mid_block_additional_residual=mid_block_res_sample,)
 
                     if args.loss_type == 'l1':
                         loss = F.l1_loss(noise, z_pred)
@@ -1087,7 +1188,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(unet3d.parameters(), args.max_grad_norm)
+                        accelerator.clip_grad_norm_(controlnet.parameters(), args.max_grad_norm)
                     optimizer.step()
                     lr_scheduler.step()
 
@@ -1107,7 +1208,7 @@ def main():
 
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_unet3d.step(unet3d.parameters())
+                    ema_controlnet.step(controlnet.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
@@ -1156,17 +1257,18 @@ def main():
 
                     if args.use_ema:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        ema_unet3d.store(unet3d.parameters())
-                        ema_unet3d.copy_to(unet3d.parameters())
+                        ema_controlnet.store(controlnet.parameters())
+                        ema_controlnet.copy_to(controlnet.parameters())
 
                     # validation
                     if accelerator.is_main_process:
                         print("### Start validation ###")
-                        log_validation(input_size, test_dataloader, vae, unet3d, noise_scheduler, accelerator, weight_dtype, global_step, args.num_samples, save_path)
+                        log_validation(input_size, test_dataloader, vae, unet3d, controlnet, noise_scheduler, accelerator, weight_dtype, global_step, args.num_samples, save_path)
                     
                     with torch.no_grad():
                         vae.eval()
                         unet3d.eval()
+                        controlnet.eval()
                         valid_loss = 0.0
                         for step, batch in enumerate(test_dataloader):
                             with torch.autocast(accelerator.device.type, dtype=weight_dtype):
@@ -1204,10 +1306,21 @@ def main():
                                     cond = bert_embed(tokenize(cond), return_cls_repr=False)
                                     cond = cond.to(latents.device)
 
+                                down_block_res_samples, mid_block_res_sample = controlnet( #####
+                                    x=noisy_latents, 
+                                    time=timesteps, 
+                                    controlnet_cond=batch["lowres_guide"], 
+                                    conditioning_scale=1.0,
+                                    patch_position=batch["patch_position"],
+                                    cond=cond
+                                )
+
                                 z_pred = unet3d(x=noisy_latents, 
                                                 time=timesteps, 
                                                 patch_position=batch["patch_position"], 
-                                                cond=cond)
+                                                cond=cond,
+                                                down_block_additional_residuals=down_block_res_samples,
+                                                mid_block_additional_residual=mid_block_res_sample,)
 
                                 if args.loss_type == 'l1':
                                     val_loss = F.l1_loss(noise, z_pred)
@@ -1242,7 +1355,7 @@ def main():
 
                     if args.use_ema:
                     # Switch back to the original UNet parameters.
-                        ema_unet3d.restore(unet3d.parameters())
+                        ema_controlnet.restore(controlnet.parameters())
 
             progress_bar.set_postfix(**logs)
 
