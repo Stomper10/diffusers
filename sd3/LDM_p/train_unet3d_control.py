@@ -622,12 +622,12 @@ class UKB_Dataset(Dataset):
             mode='trilinear',
             align_corners=False
         )  # Shape: (1, 1, D₂, H₂, W₂)
-        lowres_guide = F.interpolate(
-            lowres_guide,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        )  # Shape: (1, 1, D₂, H₂, W₂)
+        # lowres_guide = F.interpolate(
+        #     lowres_guide,
+        #     size=target_size,
+        #     mode='trilinear',
+        #     align_corners=False
+        # )  # Shape: (1, 1, D₂, H₂, W₂)
 
         # Remove the batch dimension
         image = image.squeeze(0).to(torch.float16)  # Shape: (1, D₂, H₂, W₂) # (1,218,182,182)
@@ -651,7 +651,7 @@ class UKB_Dataset(Dataset):
 
         patch_position_sampled = random.randint(0, 26)
         sample["pixel_values"] = self.get_patch_by_index(sample["pixel_values"], patch_position_sampled, self.mapping)
-        sample["lowres_guide"] = self.get_patch_by_index(lowres_guide, patch_position_sampled, self.mapping)
+        #sample["lowres_guide"] = self.get_patch_by_index(lowres_guide, patch_position_sampled, self.mapping)
         # sample["lowres_guide"] = F.interpolate(
         #     sample["lowres_guide"].unsqueeze(0).to(torch.float64),
         #     size=(38, 32, 32),

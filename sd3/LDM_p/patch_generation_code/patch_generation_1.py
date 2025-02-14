@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from diffusers.models.vq_gan_3d import VQGAN
-from diffusers.models.ddpm import PatchUnet3D, PatchGaussianDiffusion
+from diffusers.models.ddpm import PatchUnet3D, PatchGaussianDiffusion, PatchControlNet
 from monai import transforms
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -16,8 +16,9 @@ parser.add_argument("--number", "-n", type=int, required=True, default=0, help="
 args = parser.parse_args()
 
 pretrained_vae_path="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/E1_pLDM_VQGAN3D/checkpoint-770000"
-pretrained_unet_path="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/E8_pLDM_UNET3D_whole/checkpoint-60000"
-output_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E8_Gens_encoder"
+pretrained_unet_path="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/E1_pLDM_UNET3D_naive/checkpoint-320000"
+pretrained_controlnet_path="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/E4_pLDM_UNET3D_control/checkpoint-90000"
+output_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E4_Gens_control"
 mixed_precision="fp16"
 resolution="76,64,64"
 num_timesteps=1000
@@ -27,13 +28,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 vae = VQGAN.from_pretrained(pretrained_vae_path, subfolder="vqgan",).to(device)
 unet3d = PatchUnet3D.from_pretrained(pretrained_unet_path, subfolder="unet3d",).to(device)
+controlnet = PatchControlNet.from_pretrained(pretrained_controlnet_path, subfolder="controlnet",).to(device)
 vae.eval()
 unet3d.eval()
+controlnet.eval()
 noise_scheduler = PatchGaussianDiffusion(timesteps=1000).to(device)
 
-unet3d, vae = accelerator.prepare(unet3d, vae)
+unet3d, vae, controlnet = accelerator.prepare(unet3d, vae, controlnet)
 vae_model = accelerator.unwrap_model(vae)
 unet3d_model = accelerator.unwrap_model(unet3d)
+controlnet_model = accelerator.unwrap_model(controlnet)
 
 # Generation
 # Initialize lists
@@ -89,21 +93,21 @@ guide_load = torch.load("/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/l
 #     mode='trilinear',
 #     align_corners=False
 # )
-guide_raw = guide_load.squeeze(0).to(torch.float16) # (1,76,64,64)
+guide_raw = guide_load.squeeze(0).to(torch.float16) #  (1,76,64,64) / (1,218,182,182)
 
 train_transforms = transforms.Compose(
         [
-            transforms.ScaleIntensityd(keys=["pixel_values"], minv=-1.0, maxv=1.0),
-            #transforms.Resized(keys=["pixel_values"], spatial_size=input_size, size_mode="all"),
-            #transforms.CenterSpatialCropd(keys=["pixel_values"], roi_size=input_size),
-            transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=1, above=False, cval=1.0),
-            transforms.ThresholdIntensityd(keys=["pixel_values"], threshold=-1, above=True, cval=-1.0),
-            transforms.ToTensord(keys=["pixel_values"]),
+            transforms.ScaleIntensityd(keys=["lowres_guide"], minv=-1.0, maxv=1.0),
+            #transforms.Resized(keys=["lowres_guide"], spatial_size=input_size, size_mode="all"),
+            #transforms.CenterSpatialCropd(keys=["lowres_guide"], roi_size=input_size),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=1, above=False, cval=1.0),
+            transforms.ThresholdIntensityd(keys=["lowres_guide"], threshold=-1, above=True, cval=-1.0),
+            transforms.ToTensord(keys=["lowres_guide"]),
         ]
     )
 
 guide_dict = dict()
-guide_dict["pixel_values"] = guide_raw
+guide_dict["lowres_guide"] = guide_raw
 guide_dict = train_transforms(guide_dict)
 
 def gaussian_kernel_3d(kernel_size=5, sigma=2.0, device='cpu'):
@@ -165,24 +169,26 @@ with torch.no_grad():
             cond = torch.tensor([1.0], dtype=torch.float16).to(unet3d.device)
             patch_position = torch.tensor(j, dtype=torch.long).unsqueeze(0).to(unet3d.device)
 
-            # low_res_guidance = get_patch_by_index(guide_dict["pixel_values"], j, mapping) # (1,76,64,64)
+            #low_res_guidance = get_patch_by_index(guide_dict["lowres_guide"], j, mapping) # (1,76,64,64)
             # low_res_guidance = gaussian_blur_3d(low_res_guidance)
-            # low_res_guidance = low_res_guidance.unsqueeze(0)
-            low_res_guidance = guide_dict["pixel_values"].unsqueeze(0)
+            #low_res_guidance = low_res_guidance.unsqueeze(0).to(unet3d.device)
+            # low_res_guidance = guide_dict["lowres_guide"].unsqueeze(0)
+            low_res_guidance = guide_dict["lowres_guide"].unsqueeze(0).to(unet3d.device) # whole volume condition
             
             image = noise_scheduler.sample(
                 vae=vae_model,
                 unet=unet3d_model,
+                controlnet=controlnet_model,
                 image_size=int(input_size[1] / vae.config.downsample[1]),
                 num_frames=int(input_size[0] / vae.config.downsample[0]),
                 channels=int(vae.config.embedding_dim),
                 patch_position=patch_position, ###
-                low_res_guidance=low_res_guidance, ###
                 cond=cond, ###
+                low_res_guidance=low_res_guidance, ###
                 cond_scale=2., ###
                 batch_size=1
             )
             #gen_patch.append(image)
-            torch.save(image.cpu(), f"{output_dir}/E8_encoder_patch_{i+args.number}_{j}_gen1.pth")
+            torch.save(image.cpu(), f"{output_dir}/E4_control_patch_{i+args.number}_{j}_gen1.pth")
 
         #gen_images.append(gen_patch)

@@ -772,7 +772,7 @@ class GaussianDiffusion(nn.Module):
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond)).to(device)
 
-        batch_size = cond.shape[0] if exists(cond) else batch_size
+        #batch_size = cond.shape[0] if exists(cond) else batch_size
         # image_size = self.image_size
         # channels = self.channels
         # num_frames = self.num_frames
@@ -781,7 +781,7 @@ class GaussianDiffusion(nn.Module):
 
         if isinstance(vae, VQGAN):
             # denormalize TODO: Remove eventually
-            _sample = (((_sample + 1.0) / 2.0) * (vae.codebook.embeddings.max() -
+            _sample = (((_sample + 1.0) / 2.0) * (vae.codebook.embeddings.max() - # .cpu().float()
                                                   vae.codebook.embeddings.min())) + vae.codebook.embeddings.min()
 
             _sample = vae.decode(_sample, quantize=True)
@@ -857,6 +857,116 @@ class GaussianDiffusion(nn.Module):
     #     t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
     #     return self.p_losses(x, t, *args, **kwargs)
+
+# DDIM
+def select_timesteps(alphas_cumprod, num_inference_steps):
+    """
+    Given the full training schedule alphas_cumprod (a tensor of shape [T]),
+    compute the SNR for each timestep as SNR = alphas_cumprod / (1 - alphas_cumprod).
+    Then, compute the cumulative sum of SNR and select timesteps whose cumulative SNR
+    values are evenly spaced between 0 and the total SNR.
+    """
+    # Compute SNR for each timestep
+    snr = alphas_cumprod / (1 - alphas_cumprod)
+    # Compute cumulative SNR (as a proxy for "importance" over time)
+    snr_cumsum = torch.cumsum(snr, dim=0)
+    total_snr = snr_cumsum[-1]
+    
+    # Create evenly spaced quantiles along the integrated SNR curve
+    quantiles = torch.linspace(0, total_snr, steps=num_inference_steps)
+    selected_steps = []
+    for q in quantiles:
+        # Find the first timestep where the cumulative SNR exceeds q
+        idx = (snr_cumsum >= q).nonzero(as_tuple=True)[0][0].item()
+        selected_steps.append(idx)
+    return selected_steps
+
+class DDIMScheduler(nn.Module):
+    def __init__(self, timesteps=1000):
+        super().__init__()
+        betas = cosine_beta_schedule(timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.num_timesteps = timesteps
+
+        def register_buffer(name, val):
+            return self.register_buffer(name, val.to(torch.float32))
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+        # Buffers for x₀ reconstruction (matching your training)
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod - 1))
+    
+    def predict_start_from_noise(self, x_t, t, noise):
+        # This is the same as in training
+        return (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+                extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise)
+    
+    def get_inference_timesteps(self, num_inference_steps):
+        """
+        Select timesteps for inference based on integrated SNR.
+        """
+        # Use the training cumulative alphas to compute SNR
+        alphas_cumprod = self.alphas_cumprod  # shape [T]
+        selected = select_timesteps(alphas_cumprod, num_inference_steps)
+        return selected
+
+    @torch.no_grad()
+    def p_sample(self, unet, x, t, eta=0.0, cond=None, cond_scale=1.0, clip_denoised=True):
+        b, *_, device = *x.shape, x.device
+        noise_pred = unet.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
+        x0_pred = self.predict_start_from_noise(x, t, noise_pred)
+        if clip_denoised:
+            x0_pred = x0_pred.clamp(-1.0, 1.0)
+        if (t == 0).all():
+            return x0_pred
+
+        alpha_bar_t = extract(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = extract(self.alphas_cumprod_prev, t, x.shape)
+        sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) *
+                                 (1 - alpha_bar_t / alpha_bar_prev))
+        t_prev = (t - 1).clamp(min=0)
+        sqrt_alpha_bar_prev = extract(self.sqrt_alphas_cumprod, t_prev, x.shape)
+        alpha_bar_prev_extracted = extract(self.alphas_cumprod, t_prev, x.shape)
+        sqrt_term = torch.sqrt(torch.clamp(1 - alpha_bar_prev_extracted - sigma**2, 0.0))
+        x_prev = sqrt_alpha_bar_prev * x0_pred + sqrt_term * noise_pred
+        noise = torch.randn_like(x)
+        nonzero_mask = (t != 0).float().reshape(b, *((1,) * (x.ndim - 1)))
+        x_prev = x_prev + nonzero_mask * sigma * noise
+        return x_prev
+
+    @torch.no_grad()
+    def p_sample_loop(self, unet, shape, num_inference_steps, eta=0.0, cond=None, cond_scale=1.0):
+        device = self.betas.device
+        b = shape[0]
+        x = torch.randn(shape, device=device)
+        # Get non-uniform timesteps based on SNR weighting
+        timesteps = self.get_inference_timesteps(num_inference_steps)
+        # Process in reverse order
+        for i in tqdm(reversed(timesteps), desc='Non-uniform DDIM sampling'):
+            t = torch.full((b,), i, device=device, dtype=torch.long)
+            x = self.p_sample(unet, x, t, eta=eta, cond=cond, cond_scale=cond_scale)
+        return x
+
+    @torch.no_grad()
+    def sample(self, vae, unet, image_size, channels, num_frames, batch_size=16, eta=0.0, cond=None, cond_scale=1.0):
+        device = next(unet.parameters()).device
+        # Process conditioning if needed
+        if is_list_str(cond):
+            cond = bert_embed(tokenize(cond)).to(device)
+        shape = (batch_size, channels, num_frames, image_size, image_size)
+        x = self.p_sample_loop(unet, shape, self.num_timesteps, eta=eta, cond=cond, cond_scale=cond_scale)
+        if isinstance(vae, VQGAN):
+            x = (((x + 1.0) / 2.0) * (vae.codebook.embeddings.max() - vae.codebook.embeddings.min())) + vae.codebook.embeddings.min()
+            x = vae.decode(x, quantize=True)
+        else:
+            x = unnormalize_img(x)
+        return x
+
 
 # trainer class
 
@@ -1371,30 +1481,26 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         t = torch.cat([emb for emb in cond_emb_list if emb is not None], dim=-1)
 
         h = [x] ###
-        j = [] ###
 
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
             h.append(x)
             x = block2(x, t)
-            h.append(x)
             x = spatial_attn(x)
-            h.append(x)
             x = temporal_attn(x, pos_bias=time_rel_pos_bias,
                               focus_present_mask=focus_present_mask)
-            h.append(x)
-            j.append(x)
             x = downsample(x)
-            h.append(x)
 
+        # print("### len(h):", len(h))
+        # print("### h.shape list:", [elem.shape for elem in h])
         # Additional residual conections for Controlnets
         if down_block_additional_residuals is not None:
-            new_down_block_res_samples = ()
+            new_down_block_res_samples = []
             for down_block_res_sample, down_block_additional_residual in zip(
                 h, down_block_additional_residuals
             ):
                 down_block_res_sample = down_block_res_sample + down_block_additional_residual
-                new_down_block_res_samples += (down_block_res_sample,)
+                new_down_block_res_samples += [down_block_res_sample,]
 
             h = new_down_block_res_samples
 
@@ -1408,11 +1514,18 @@ class PatchUnet3D(ModelMixin, ConfigMixin):
         if mid_block_additional_residual is not None:
             x = x + mid_block_additional_residual
 
+        # print("### len(h):", len(h))
+        # print("### h.shape list:", [elem.shape for elem in h])
+        #h.pop() ###
         for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
-            x = torch.cat((x, j.pop()), dim=1) ###
+            x = torch.cat((x, h.pop()), dim=1) ###
+            # print("### 1 x.shape:", x.shape) # 2048
             x = block1(x, t)
+            # print("### 2 x.shape:", x.shape) # 512
             x = block2(x, t)
+            # print("### 3 x.shape:", x.shape) # 512
             x = spatial_attn(x)
+            # print("### 4 x.shape:", x.shape) # 512
             x = temporal_attn(x, pos_bias=time_rel_pos_bias,
                               focus_present_mask=focus_present_mask)
             x = upsample(x)
@@ -1590,7 +1703,7 @@ class PatchGaussianDiffusion(nn.Module):
                                     x=img,
                                     time=torch.full((b,), i, device=device, dtype=torch.long), 
                                     controlnet_cond=low_res_guidance, 
-                                    conditioning_scale=1.0,
+                                    conditioning_scale=2.0, #####
                                     patch_position=patch_position,
                                     cond=cond
                                 )
@@ -1785,15 +1898,15 @@ class PatchControlNet(ModelMixin, ConfigMixin):
             ]))
 
             ###
-            for _ in range(4):
+            for _ in range(1):
                 controlnet_block = nn.Conv3d(dim_out, dim_out, kernel_size=1)
                 controlnet_block = zero_module(controlnet_block)
                 self.controlnet_down_blocks.append(controlnet_block)
 
-            if not is_last:
-                controlnet_block = nn.Conv3d(dim_out, dim_out, kernel_size=1)
-                controlnet_block = zero_module(controlnet_block)
-                self.controlnet_down_blocks.append(controlnet_block)
+            # if not is_last:
+            #     controlnet_block = nn.Conv3d(dim_out, dim_out, kernel_size=1)
+            #     controlnet_block = zero_module(controlnet_block)
+            #     self.controlnet_down_blocks.append(controlnet_block)
             ###
         
         mid_dim = dims[-1]
@@ -1887,14 +2000,14 @@ class PatchControlNet(ModelMixin, ConfigMixin):
             x = block1(x, t)
             h.append(x)
             x = block2(x, t)
-            h.append(x)
+            #h.append(x)
             x = spatial_attn(x)
-            h.append(x)
+            #h.append(x)
             x = temporal_attn(x, pos_bias=time_rel_pos_bias,
                               focus_present_mask=focus_present_mask)
-            h.append(x)
+            #h.append(x)
             x = downsample(x)
-            h.append(x)
+            #h.append(x)
         
         x = self.mid_block1(x, t)
         x = self.mid_spatial_attn(x)

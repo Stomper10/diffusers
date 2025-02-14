@@ -6,7 +6,7 @@ echo "Training wLDM (2+1)D UNET from scratch."
 echo "'c': (3, 1, 0, 2)"
 
 export JOB_NAME="test_wLDM_UNET3D"
-export VAE_PATH="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/E1_wLDM_VQGAN3D/checkpoint-2000000"
+export VAE_PATH="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/E7_wLDM_VQGAN3D/checkpoint-10000"
 
 accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/config_single.yaml \
     /shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/train_unet3d.py \
@@ -17,7 +17,7 @@ accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/c
     --output_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_w/results/$JOB_NAME" \
     --resume_from_checkpoint="latest" \
     --axis="c" \
-    --dim_mults="2,4,8,16,32" \
+    --dim_mults="32,64,64" \
     --attn_heads=24 \
     --seed=42 \
     --allow_tf32 \
@@ -25,13 +25,13 @@ accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/c
     --mixed_precision="fp16" \
     --dataloader_num_workers=4 \
     --tracker_project_name=$JOB_NAME \
-    --resolution="76,64,64" \
+    --resolution="224,40,40" \
     --learning_rate=1e-5 \
     --scale_lr \
     --lr_scheduler="polynomial" \
-    --gradient_accumulation_steps=1 \
-    --train_batch_size=4 \
-    --valid_batch_size=4 \
+    --gradient_accumulation_steps=4 \
+    --train_batch_size=1 \
+    --valid_batch_size=1 \
     --max_train_steps=100 \
     --checkpointing_steps=20 \
     --num_samples=1 \

@@ -20,15 +20,15 @@ accelerate launch --config_file /shared/s1/lab06/wonyoung/diffusers/sd3/config/c
     --mixed_precision="fp16" \
     --dataloader_num_workers=4 \
     --tracker_project_name=$JOB_NAME \
-    --resolution="76,64,64" \
+    --resolution="224,40,40" \
     --learning_rate_ae=1e-5 \
     --learning_rate_disc=1e-5 \
     --scale_lr \
     --lr_scheduler="constant" \
-    --gradient_accumulation_steps=1 \
+    --gradient_accumulation_steps=4 \
     --gradient_checkpointing \
-    --train_batch_size=2 \
-    --valid_batch_size=2 \
+    --train_batch_size=1 \
+    --valid_batch_size=1 \
     --max_train_steps=100 \
     --discriminator_iter_start=10 \
     --checkpointing_steps=20 \

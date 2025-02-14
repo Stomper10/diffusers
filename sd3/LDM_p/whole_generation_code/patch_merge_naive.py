@@ -78,8 +78,8 @@ for start_d in depth_starts:
             index += 1
 
 ###
-mode = 'encoder'
-ex_num = 8
+mode = 'control'
+ex_num = 4
 #mode = 'noguide'
 
 # merge
@@ -92,7 +92,7 @@ if mode == 'noguide':
 else:
     dir_idx_name = sorted(list(set([int(name.split("_")[3]) for name in dir_idx])))[:100]
 print(len(dir_idx_name))
-dir_idx_name = [0]
+dir_idx_name = [200]
 
 patch_size = (76, 64, 64)
 volume_shape = (1, 218, 182, 182)
@@ -105,7 +105,7 @@ for name in dir_idx_name:
     for idx in range(27):
         # Generate or load the patch corresponding to index idx
         # For example, use your model to generate the patch
-        patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E{ex_num}_Gens_{mode}/E6_{mode}_patch_{name}_{idx}_gen1.pth").squeeze(0)
+        patch = torch.load(f"/shared/s1/lab06/wonyoung/diffusers/sd3/LDM_p/results/patch_generation/E{ex_num}_Gens_{mode}/E{ex_num}_{mode}_patch_{name}_{idx}_gen1.pth").squeeze(0)
         patches.append(patch)
 
     # Merge adjusted patches
