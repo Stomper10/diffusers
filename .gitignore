@@ -190,5 +190,11 @@ labs
 sd3/3d_visualize*
 sd3/test.py
 sd3/data/raw/*
+sd3/LDM_w/*
+sd3/LDM_p/*
+sd3/code_templates/*
+sd3/LDM/outputs/*
+sd3/LDM/results/*
+sd3/LDM/gen_volumes/*
 
 
